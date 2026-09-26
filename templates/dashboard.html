@@ -1,0 +1,173 @@
+﻿<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Second Brain Trader</title>
+<style>
+:root{--bg:#0e1117;--panel:#161b22;--border:#2a3142;--text:#e6edf3;
+--dim:#8b949e;--green:#3fb950;--red:#f85149;--yellow:#d29922;--blue:#58a6ff}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--text);font:13px 'Segoe UI',sans-serif;padding:14px}
+.header{display:flex;justify-content:space-between;align-items:center;margin-bottom:14px}
+.title{font-size:18px;font-weight:600}
+.badge{display:inline-block;padding:2px 8px;border-radius:4px;font-size:11px;
+font-weight:600;margin-top:4px}
+.badge.paper{background:#1e3a5f;color:var(--blue)}
+.badge.live{background:#5c1a1a;color:var(--red)}
+.btn{padding:8px 18px;border:none;border-radius:4px;font-weight:600;cursor:pointer}
+.btn.start{background:var(--green);color:#08130a}
+.btn.stop{background:var(--red);color:#160606}
+.btn:disabled{opacity:.4;cursor:not-allowed}
+.metrics{display:grid;grid-template-columns:repeat(6,1fr);gap:8px;margin-bottom:14px}
+.card{background:var(--panel);padding:10px 14px;border-radius:6px}
+.card .lbl{color:var(--dim);font-size:10px;letter-spacing:.5px;text-transform:uppercase}
+.card .val{font:600 16px 'Consolas',monospace;margin-top:2px}
+.main{display:grid;grid-template-columns:320px 1fr 400px;gap:10px}
+.panel{background:var(--panel);border-radius:6px;padding:12px;
+display:flex;flex-direction:column}
+.panel h3{font-size:13px;font-weight:600;margin-bottom:8px}
+table{width:100%;border-collapse:collapse;font-size:12px}
+th{text-align:left;color:var(--dim);font-size:10px;padding:4px 6px;text-transform:uppercase}
+td{padding:5px 6px;border-top:1px solid var(--border)}
+.pl-pos{color:var(--green)}.pl-neg{color:var(--red)}
+canvas{width:100%;display:block;background:var(--panel);border-radius:4px}
+#candle{height:340px}#equity{height:120px;margin-top:8px}
+.trade-info{font:11px 'Consolas',monospace;margin-top:6px;color:var(--dim)}
+.log{overflow-y:auto;font:11px 'Consolas',monospace;flex:1;max-height:600px}
+.log div{padding:2px 0;word-break:break-word}
+.log .time{color:var(--dim);margin-right:6px}
+.log .trade{color:var(--green)}.log .warn{color:var(--yellow)}
+.log .error{color:var(--red)}
+.halt{color:var(--red);font-weight:600;margin-top:8px}
+</style>
+</head>
+<body>
+<div class="header">
+<div><div class="title">Second Brain Trader</div>
+<span id="modeBadge" class="badge paper">PAPER</span></div>
+<div><button id="startBtn" class="btn start" onclick="startEngine()">Start</button>
+<button id="stopBtn" class="btn stop" onclick="stopEngine()" disabled>Stop</button></div>
+</div>
+<div class="metrics">
+<div class="card"><div class="lbl">Equity</div><div class="val" id="mEquity">$0</div></div>
+<div class="card"><div class="lbl">Buying Power</div><div class="val" id="mBP">$0</div></div>
+<div class="card"><div class="lbl">Positions</div><div class="val" id="mPos">0</div></div>
+<div class="card"><div class="lbl">Unrealized P/L</div><div class="val" id="mPL">$0</div></div>
+<div class="card"><div class="lbl">Cycle</div><div class="val" id="mCycle">0</div></div>
+<div class="card"><div class="lbl">Status</div><div class="val" id="mStatus">Idle</div></div>
+</div>
+<div class="main">
+<div class="panel"><h3>Open Positions</h3>
+<table><thead><tr><th>Sym</th><th>Qty</th><th>Entry</th><th>Now</th><th>P/L</th></tr></thead>
+<tbody id="posBody"></tbody></table>
+<div id="haltMsg" class="halt"></div></div>
+<div class="panel"><h3>Live Chart — <span id="focusSym">-</span></h3>
+<canvas id="candle" width="640" height="340"></canvas>
+<div class="trade-info" id="tradeInfo">No active trade</div>
+<canvas id="equity" width="640" height="120"></canvas></div>
+<div class="panel"><h3>Activity Log</h3><div class="log" id="logBox"></div></div>
+</div>
+<script>
+const $=id=>document.getElementById(id);
+const fmt$=n=>"$"+Number(n).toLocaleString(undefined,{maximumFractionDigits:2});
+const fmtN=(n,d=2)=>Number(n).toFixed(d);
+async function startEngine(){await fetch("/api/start",{method:"POST"});
+$("startBtn").disabled=true;$("stopBtn").disabled=false;}
+async function stopEngine(){await fetch("/api/stop",{method:"POST"});
+$("startBtn").disabled=false;$("stopBtn").disabled=true;}
+let currentSym=null,bars=[],trade=null,equityCurve=[];
+async function tick(){try{
+const d=await (await fetch("/api/state")).json();
+$("mEquity").textContent=fmt$(d.equity||0);
+$("mBP").textContent=fmt$(d.buying_power||0);
+$("mPos").textContent=(d.positions||[]).length;
+const pl=(d.positions||[]).reduce((a,p)=>a+(p.unrealized_pl||0),0);
+const plEl=$("mPL");plEl.textContent=(pl>=0?"+":"")+fmt$(pl);
+plEl.style.color=pl>=0?"var(--green)":"var(--red)";
+$("mCycle").textContent=d.cycle||0;
+$("mStatus").textContent=d.running?"Running":"Idle";
+const b=$("modeBadge");b.textContent=d.mode||"PAPER";
+b.className="badge "+(d.mode==="LIVE"?"live":"paper");
+$("posBody").innerHTML=(d.positions||[]).map(p=>{
+const v=p.unrealized_pl||0;const cls=v>=0?"pl-pos":"pl-neg";
+return `<tr><td>${p.symbol}</td><td>${Math.round(p.qty)}</td>
+<td>$${fmtN(p.avg_entry)}</td><td>$${fmtN(p.current_price)}</td>
+<td class="${cls}">${v>=0?"+":""}$${fmtN(v)} (${fmtN(p.unrealized_plpc)}%)</td></tr>`;
+}).join("");
+$("haltMsg").textContent=d.halted?("HALTED: "+(d.halt_reason||"")):"";
+const syms=Object.keys(d.bars||{});
+if(syms.length){const pick=syms.find(s=>d.trades&&d.trades[s])||syms[0];
+currentSym=pick;bars=d.bars[pick]||[];trade=d.trades?d.trades[pick]:null;
+$("focusSym").textContent=pick;drawCandles();}
+equityCurve=(d.equity_curve||[]).map(x=>x[1]);drawEquity();
+const logBox=$("logBox");
+logBox.innerHTML=(d.log||[]).map(l=>
+`<div><span class="time">[${l.ts}]</span><span class="${l.level}">${l.msg}</span></div>`
+).join("");
+logBox.scrollTop=logBox.scrollHeight;
+}catch(e){console.error(e);}}
+setInterval(tick,2000);tick();
+function drawCandles(){const c=$("candle"),ctx=c.getContext("2d");
+const W=c.width,H=c.height;ctx.clearRect(0,0,W,H);
+if(!bars||bars.length<2){ctx.fillStyle="#8b949e";ctx.font="13px sans-serif";
+ctx.textAlign="center";ctx.fillText("Waiting for bar data...",W/2,H/2);return;}
+const padL=8,padR=70,padT=24,padB=20;const pw=W-padL-padR,ph=H-padT-padB;
+let pmin=Math.min(...bars.map(b=>b.l)),pmax=Math.max(...bars.map(b=>b.h));
+if(trade){pmin=Math.min(pmin,trade.sl,trade.tp);pmax=Math.max(pmax,trade.sl,trade.tp);}
+const ps=(pmax-pmin)||1;const py=p=>padT+ph*(1-(p-pmin)/ps);
+ctx.strokeStyle="#2a3142";ctx.setLineDash([2,4]);ctx.fillStyle="#8b949e";
+ctx.font="10px Consolas";ctx.textAlign="left";
+for(let i=0;i<5;i++){const y=padT+ph*i/4;
+ctx.beginPath();ctx.moveTo(padL,y);ctx.lineTo(padL+pw,y);ctx.stroke();
+ctx.fillText((pmax-ps*i/4).toFixed(2),W-60,y+3);}
+ctx.setLineDash([]);
+if(trade){const ye=py(trade.entry),ys=py(trade.sl),yt=py(trade.tp);
+ctx.fillStyle="rgba(63,185,80,0.10)";ctx.fillRect(padL,Math.min(ye,yt),pw,Math.abs(ye-yt));
+ctx.fillStyle="rgba(248,81,73,0.10)";ctx.fillRect(padL,Math.min(ye,ys),pw,Math.abs(ye-ys));
+ctx.strokeStyle="#3fb950";ctx.setLineDash([5,3]);
+ctx.beginPath();ctx.moveTo(padL,yt);ctx.lineTo(padL+pw,yt);ctx.stroke();
+ctx.strokeStyle="#f85149";ctx.beginPath();ctx.moveTo(padL,ys);ctx.lineTo(padL+pw,ys);ctx.stroke();
+ctx.strokeStyle="#58a6ff";ctx.setLineDash([]);
+ctx.beginPath();ctx.moveTo(padL,ye);ctx.lineTo(padL+pw,ye);ctx.stroke();
+ctx.fillStyle="#3fb950";ctx.textAlign="right";ctx.fillText("TP "+trade.tp.toFixed(2),W-4,yt+3);
+ctx.fillStyle="#f85149";ctx.fillText("SL "+trade.sl.toFixed(2),W-4,ys+3);
+ctx.fillStyle="#58a6ff";ctx.fillText("E "+trade.entry.toFixed(2),W-4,ye+3);}
+const n=bars.length,step=pw/n,bw=Math.max(2,step*0.65);
+bars.forEach((b,i)=>{const cx=padL+step*(i+0.5);const up=b.c>=b.o;
+const col=up?"#3fb950":"#f85149";ctx.strokeStyle=col;
+ctx.beginPath();ctx.moveTo(cx,py(b.h));ctx.lineTo(cx,py(b.l));ctx.stroke();
+const yo=py(b.o),yc=py(b.c);const top=Math.min(yo,yc),bot=Math.max(yo,yc);
+ctx.fillStyle=col;ctx.fillRect(cx-bw/2,top,bw,Math.max(1,bot-top));});
+const last=bars[bars.length-1];const chg=((last.c/bars[0].o-1)*100).toFixed(2);
+ctx.fillStyle="#e6edf3";ctx.textAlign="left";ctx.font="600 11px Segoe UI";
+ctx.fillText(`${currentSym} — ${n} bars`,padL+4,12);
+ctx.fillStyle=chg>=0?"#3fb950":"#f85149";ctx.fillText(`${chg>=0?"+":""}${chg}%`,padL+140,12);
+const yl=py(last.c);ctx.strokeStyle="#58a6ff";ctx.setLineDash([3,3]);
+ctx.beginPath();ctx.moveTo(padL,yl);ctx.lineTo(padL+pw,yl);ctx.stroke();
+ctx.setLineDash([]);ctx.fillStyle="#58a6ff";ctx.textAlign="right";
+ctx.fillText(last.c.toFixed(2),W-4,yl+3);
+const ti=$("tradeInfo");
+if(trade){const pl=(last.c-trade.entry)*trade.qty;
+ti.textContent=`ACTIVE ${trade.side} ${trade.qty} @ ${trade.entry.toFixed(2)} | Now ${last.c.toFixed(2)} | P/L $${pl>=0?"+":""}${pl.toFixed(2)} | SL ${trade.sl} TP ${trade.tp}`;
+ti.style.color=pl>=0?"#3fb950":"#f85149";}
+else{ti.textContent="No active trade on this symbol";ti.style.color="#8b949e";}}
+function drawEquity(){const c=$("equity"),ctx=c.getContext("2d");
+const W=c.width,H=c.height;ctx.clearRect(0,0,W,H);
+if(equityCurve.length<2){ctx.fillStyle="#8b949e";ctx.font="12px sans-serif";
+ctx.textAlign="center";ctx.fillText("—",W/2,H/2);return;}
+const pad=16,n=equityCurve.length;
+const mn=Math.min(...equityCurve),mx=Math.max(...equityCurve);
+const span=(mx-mn)||1;const pts=equityCurve.map((v,i)=>
+[pad+(W-2*pad)*i/(n-1),H-pad-(H-2*pad)*(v-mn)/span]);
+ctx.strokeStyle="#2a3142";ctx.setLineDash([2,3]);
+ctx.beginPath();ctx.moveTo(pad,H-pad);ctx.lineTo(W-pad,H-pad);ctx.stroke();
+ctx.setLineDash([]);ctx.strokeStyle="#58a6ff";ctx.lineWidth=2;
+ctx.beginPath();pts.forEach(([x,y],i)=>i?ctx.lineTo(x,y):ctx.moveTo(x,y));
+ctx.stroke();const [lx,ly]=pts[pts.length-1];ctx.fillStyle="#3fb950";
+ctx.beginPath();ctx.arc(lx,ly,3,0,Math.PI*2);ctx.fill();
+ctx.fillStyle="#8b949e";ctx.font="10px Consolas";ctx.textAlign="left";
+ctx.fillText("$"+mx.toFixed(0),pad,12);ctx.fillText("$"+mn.toFixed(0),pad,H-4);}
+</script>
+</body>
+</html>

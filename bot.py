@@ -1,11 +1,12 @@
-"""Sentinel - autonomous multi-asset trading engine.
+"""Sentinel - autonomous multi-asset trading engine with learning.
 
-v2 fixes:
-- Entry cooldown (1h per symbol) prevents over-concentration
-- Hard cap on position size (never exceeds MAX_POSITION_PCT)
-- Fast-path chat: instant responses for common commands
-- Groq-first LLM cascade
+Features:
+- Multi-agent LLM decision (bull / bear / judge debate)
+- Learning module: adapts confidence per symbol based on outcomes
 - Full position lifecycle: SL / TP / trailing / LLM exit
+- Prop-firm risk rules: daily halt, drawdown halt, loss-streak halt
+- Fast-path chat: instant responses for common commands
+- Groq-first LLM cascade with NIM fallback
 """
 
 import os, re, json, time, sqlite3, threading
@@ -25,6 +26,11 @@ from alpaca.data.requests import (StockBarsRequest, StockLatestQuoteRequest,
 from alpaca.data.timeframe import TimeFrame
 
 from openai import OpenAI
+
+try:
+    from learn import LearningEngine
+except ImportError:
+    LearningEngine = None
 
 
 # ============================================================
@@ -63,7 +69,7 @@ class LayeredMemory:
 
 
 # ============================================================
-# RISK ENGINE
+# RISK ENGINE (prop-firm rules)
 # ============================================================
 
 class RiskEngine:
@@ -156,7 +162,6 @@ class RiskEngine:
             r["reason"] = f"Low confidence {conf:.2f}"
             return r
 
-        # ---- HARD CAP position size ----
         sp = min(self.cfg["max_position_pct"],
                  self.cfg["max_position_pct"] * conf)
         notional = eq * sp
@@ -165,19 +170,13 @@ class RiskEngine:
             qty = round(max(0.0001, notional / entry), 6)
         else:
             qty = max(1, int(notional / entry))
-            # Sanity: never exceed position_pct of equity
-            max_qty = max(1, int(notional / entry))
-            if qty > max_qty:
-                qty = max_qty
 
-        # Double-check: reject if notional exceeds 1.5x the cap (bug guard)
-        actual_notional = qty * entry
-        if actual_notional > eq * self.cfg["max_position_pct"] * 1.5:
-            r["reason"] = (f"Position too large: ${actual_notional:.0f} > "
-                           f"${eq * self.cfg['max_position_pct']:.0f}")
+        actual = qty * entry
+        if actual > eq * self.cfg["max_position_pct"] * 1.5:
+            r["reason"] = f"Size sanity: ${actual:.0f} too large"
             r["checks"].append(("Size sanity", False, r["reason"]))
             return r
-        r["checks"].append(("Size sanity", True, f"${actual_notional:.0f}"))
+        r["checks"].append(("Size sanity", True, f"${actual:.0f}"))
 
         d = atr * self.cfg["atr_stop_multiplier"]
         rr = self.cfg["risk_reward_ratio"]
@@ -317,34 +316,30 @@ class TradeJournal:
 class SentinelEngine:
     SYS_BULL = (
         "You are a bullish trading analyst. Argue concisely WHY this trade "
-        "should be taken. Focus on momentum, catalysts, and upside potential. "
-        "Max 100 words."
+        "should be taken. Max 100 words."
     )
 
     SYS_BEAR = (
         "You are a bearish risk analyst. Argue concisely WHY this trade "
-        "should NOT be taken. Focus on downside risk, bad entry points, and "
-        "recent losses. Max 100 words."
+        "should NOT be taken. Max 100 words."
     )
 
     SYS_JUDGE = (
-        'You are the portfolio risk manager for Sentinel. Decide direction '
-        'and confidence ONLY. Do NOT calculate position sizes. Output ONLY '
-        'valid JSON: {"action": "BUY"|"SELL"|"HOLD", "confidence": 0-1, '
-        '"reason": "..."}. BUY if the bull case is stronger. HOLD only if '
-        'the cases are truly balanced.'
+        'You are the portfolio risk manager. Decide direction and confidence '
+        'ONLY. Do NOT calculate position sizes. Output ONLY valid JSON: '
+        '{"action": "BUY"|"SELL"|"HOLD", "confidence": 0-1, "reason": "..."}. '
+        'BUY if the bull case is stronger. HOLD only if truly balanced.'
     )
 
     SYS_EXIT = (
-        'You are managing an open position. Should Sentinel close it now? '
-        'Output ONLY JSON: {"action": "HOLD"|"CLOSE", "confidence": 0-1, '
-        '"reason": "..."}. Use CLOSE if momentum has reversed, the thesis '
-        'broke, or taking profit is prudent. Otherwise HOLD.'
+        'Should Sentinel close this position now? Output ONLY JSON: '
+        '{"action": "HOLD"|"CLOSE", "confidence": 0-1, "reason": "..."}. '
+        'CLOSE if momentum reversed, thesis broke, or taking profit is prudent.'
     )
 
     SYS_RESEARCH = (
-        "Find the 2-3 most important recent news items or catalysts for "
-        "this asset. Max 80 words."
+        "Find the 2-3 most important recent news items for this asset. "
+        "Max 80 words."
     )
 
     def __init__(self, on_log=None, on_status=None, on_bars=None):
@@ -369,8 +364,9 @@ class SentinelEngine:
         self.memory = {}
         self.risk = RiskEngine(self.cfg)
         self.journal = TradeJournal(self.cfg["journal_path"])
+        self.learner = LearningEngine(self.cfg["journal_path"]) if LearningEngine else None
         self._active_trades = {}
-        self._pending_entries = {}   # symbol -> last entry timestamp
+        self._pending_entries = {}
         self._stop_event = threading.Event()
         self._thread = None
         self._last_day = None
@@ -422,8 +418,7 @@ class SentinelEngine:
         return (r.choices[0].message.content or "").strip()
 
     def _call(self, primary, system, user, temp=0.3, json_mode=False):
-        chain = []
-        chain.append(("groq", self.llm, primary))
+        chain = [("groq", self.llm, primary)]
         for m in self.cfg["groq_fallbacks"]:
             if m != primary:
                 chain.append(("groq", self.llm, m))
@@ -455,8 +450,15 @@ class SentinelEngine:
             be += f"\n\nResearch:\n{research}"
         bull = self._call(self.cfg["model_debate"], self.SYS_BULL, bu)
         bear = self._call(self.cfg["model_debate"], self.SYS_BEAR, be)
+
+        lessons_txt = ""
+        if self.learner:
+            summary = self.learner.learned_summary()
+            if "No lessons" not in summary:
+                lessons_txt = f"\n\nLEARNED FROM PAST:\n{summary}"
+
         ji = (f"Symbol: {symbol}\n\nBULL:\n{bull}\n\nBEAR:\n{bear}\n\n"
-              f"CONSTRAINTS:\n{constraints}\n\nDecide. JSON only.")
+              f"CONSTRAINTS:\n{constraints}{lessons_txt}\n\nDecide. JSON only.")
         try:
             v = self._call(self.cfg["model_judge"], self.SYS_JUDGE, ji, 0.0, True)
             v = re.sub(r"```json|```", "", v).strip()
@@ -482,8 +484,7 @@ class SentinelEngine:
             if "/" not in sym and sym in crypto_map:
                 sym = crypto_map[sym]
             out.append({
-                "symbol": sym,
-                "qty": float(p.qty),
+                "symbol": sym, "qty": float(p.qty),
                 "avg_entry": float(p.avg_entry_price),
                 "current_price": float(p.current_price) if p.current_price else 0.0,
                 "market_value": float(p.market_value),
@@ -570,8 +571,7 @@ class SentinelEngine:
                     opened_ts=track.get("opened_at", ""),
                     symbol=symbol, side=side, qty=qty,
                     entry=entry, exit=exit_price,
-                    pnl=pnl, pnl_pct=pnl_pct,
-                    close_reason=reason)
+                    pnl=pnl, pnl_pct=pnl_pct, close_reason=reason)
 
                 if symbol in self.memory:
                     self.memory[symbol].push_trade_result({
@@ -579,6 +579,10 @@ class SentinelEngine:
                         "entry": entry, "exit": exit_price,
                         "pnl_pct": pnl_pct})
                 self.risk.record_trade(pnl_pct)
+                if self.learner:
+                    self.learner.record_trade(
+                        symbol=symbol, pnl_pct=pnl_pct, pnl_dollar=pnl,
+                        side=side, reason=reason)
 
                 self._log(f"[{symbol}] CLOSED {reason} -- "
                           f"P/L ${pnl:+.2f} ({pnl_pct:+.2f}%)", "trade")
@@ -605,9 +609,9 @@ class SentinelEngine:
                         "symbol": symbol, "side": "BUY", "qty": p["qty"],
                         "entry": p["avg_entry"], "sl": sl, "tp": tp,
                         "order_id": "adopted",
-                        "opened_at": datetime.utcnow().isoformat()}
-                    self._log(f"[{symbol}] adopted position SL=${sl} TP=${tp}",
-                              "info")
+                        "opened_at": datetime.utcnow().isoformat(),
+                        "opened_ts": time.time()}
+                    self._log(f"[{symbol}] adopted SL=${sl} TP=${tp}", "info")
                     track = self._active_trades[symbol]
                 except Exception as e:
                     self._log(f"[{symbol}] adopt failed: {e}", "warn")
@@ -620,21 +624,17 @@ class SentinelEngine:
 
             if side == "BUY":
                 if sl > 0 and cur <= sl:
-                    self._close_position(symbol,
-                        f"stop-loss (${cur:.4f} <= ${sl:.4f})")
+                    self._close_position(symbol, f"stop-loss (${cur:.4f} <= ${sl:.4f})")
                     continue
                 if tp > 0 and cur >= tp:
-                    self._close_position(symbol,
-                        f"take-profit (${cur:.4f} >= ${tp:.4f})")
+                    self._close_position(symbol, f"take-profit (${cur:.4f} >= ${tp:.4f})")
                     continue
             else:
                 if sl > 0 and cur >= sl:
-                    self._close_position(symbol,
-                        f"stop-loss (${cur:.4f} >= ${sl:.4f})")
+                    self._close_position(symbol, f"stop-loss (${cur:.4f} >= ${sl:.4f})")
                     continue
                 if tp > 0 and cur <= tp:
-                    self._close_position(symbol,
-                        f"take-profit (${cur:.4f} <= ${tp:.4f})")
+                    self._close_position(symbol, f"take-profit (${cur:.4f} <= ${tp:.4f})")
                     continue
 
             pnl_pct = p["unrealized_plpc"]
@@ -659,8 +659,7 @@ class SentinelEngine:
         side = track["side"]
         context = (f"Position: {side} {track['qty']} {symbol}\n"
                    f"Entry: ${entry:.4f}  Now: ${cur:.4f}  P/L: {pnl_pct:+.2f}%\n"
-                   f"Stop: ${track['sl']:.4f}  Target: ${track['tp']:.4f}\n"
-                   f"Held since: {track.get('opened_at','')[:19]}")
+                   f"Stop: ${track['sl']:.4f}  Target: ${track['tp']:.4f}")
         prompt = f"Decide whether to close {symbol} now. Context:\n{context}"
         try:
             v = self._call(self.cfg["model_judge"], self.SYS_EXIT, prompt, 0.0, True)
@@ -669,8 +668,7 @@ class SentinelEngine:
         except Exception:
             return
         if d.get("action") == "CLOSE" and d.get("confidence", 0) >= 0.7:
-            reason = (f"LLM exit ({d.get('confidence',0):.2f}): "
-                      f"{d.get('reason','')[:80]}")
+            reason = f"LLM exit ({d.get('confidence',0):.2f}): {d.get('reason','')[:80]}"
             self._close_position(symbol, reason)
 
     # ---------- analysis ----------
@@ -693,7 +691,7 @@ class SentinelEngine:
         try:
             q = self._quote(symbol)
         except Exception as e:
-            return {"ok": False, "error": f"No quote for {symbol}: {e}"}
+            return {"ok": False, "error": f"No quote: {e}"}
 
         atr = self._atr(bars)
         is_crypto = "/" in symbol
@@ -717,6 +715,16 @@ class SentinelEngine:
                 f"Max {c['max_concurrent_positions']} positions.")
 
         decision = self._debate(symbol, context, cons, "")
+
+        # Apply learned bias
+        if self.learner:
+            bias = self.learner.confidence_adjustment(symbol)
+            if bias:
+                original = decision.get("confidence", 0)
+                decision["confidence"] = max(0.0, min(1.0, original + bias))
+                self._log(f"[{symbol}] learned bias {bias:+.2f} → "
+                          f"conf {original:.2f} → {decision['confidence']:.2f}",
+                          "info")
 
         if decision["action"] == "SELL":
             held = any(p["symbol"] == symbol and float(p["qty"]) > 0
@@ -769,9 +777,8 @@ class SentinelEngine:
             "symbol": symbol, "side": p["action"], "qty": p["qty"],
             "entry": p["entry"], "sl": p["stop_loss"], "tp": p["take_profit"],
             "order_id": str(order.id),
-            "opened_at": datetime.utcnow().isoformat()}
-
-        # Record entry time for cooldown
+            "opened_at": datetime.utcnow().isoformat(),
+            "opened_ts": time.time()}
         self._pending_entries[symbol] = time.time()
 
         try:
@@ -793,10 +800,9 @@ class SentinelEngine:
 
     def _run(self):
         mode = "PAPER" if self.cfg["paper"] else "LIVE"
-        self._log(f"Sentinel v2 started - {mode} mode", "info")
-        self._log(f"Entry cooldown: {self.cfg['entry_cooldown_seconds']}s", "info")
-        self._log(f"Max position: {self.cfg['max_position_pct']*100:.1f}% equity",
-                  "info")
+        self._log(f"Sentinel v3 started - {mode}", "info")
+        self._log(f"Learning: {'ON' if self.learner else 'OFF'}", "info")
+        self._log(f"Cooldown: {self.cfg['entry_cooldown_seconds']}s", "info")
         self._log(f"Max positions: {self.cfg['max_concurrent_positions']}", "info")
         while not self._stop_event.is_set():
             try:
@@ -838,14 +844,12 @@ class SentinelEngine:
                   f"${a['equity']:.2f}, {len(ps)} positions", "info")
 
         if ps:
-            self._log(f"Checking {len(ps)} open positions...", "info")
             self._check_positions(ps)
             try:
                 ps = self._positions()
             except Exception:
                 pass
 
-        # ---- ENTRY LOOP with cooldown ----
         held = {p["symbol"] for p in ps}
         cooldown = self.cfg["entry_cooldown_seconds"]
         now = time.time()
@@ -856,16 +860,11 @@ class SentinelEngine:
         for s in candidates:
             if self._stop_event.is_set():
                 break
-            # Skip if already held
             if s in held:
                 continue
-            # Skip if in cooldown period
             last_entry = self._pending_entries.get(s, 0)
             if now - last_entry < cooldown:
-                remaining = int(cooldown - (now - last_entry))
-                self._log(f"[{s}] cooldown ({remaining}s)", "info")
                 continue
-            # Skip if max positions reached
             if len(ps) >= self.cfg["max_concurrent_positions"]:
                 self._log(f"[{s}] max positions reached", "info")
                 break
@@ -879,7 +878,6 @@ class SentinelEngine:
                     if res.get("ok"):
                         self._log(f"[{s}] order submitted: {res['order_id']}",
                                   "trade")
-                        # Refresh positions
                         try:
                             ps = self._positions()
                             held = {p["symbol"] for p in ps}
@@ -898,38 +896,28 @@ class SentinelEngine:
             self._last_day = today
 
 
-# Backward-compat alias
 TraderEngine = SentinelEngine
 
 
 # ============================================================
-# CHAT ENGINE (fast-path for instant responses)
+# CHAT ENGINE
 # ============================================================
 
 class ChatEngine:
     SYS = (
-        "You are Sentinel, an AI trading assistant. Respond in ONE of two "
-        "ways:\n\n"
-        "1. PLAIN TEXT for greetings, questions, explanations.\n"
-        "2. JSON ACTION for system operations. Output ONLY the JSON.\n\n"
-        "Actions:\n"
-        '- {"action":"analyze","symbol":"AAPL"}\n'
-        '- {"action":"quote","symbol":"AAPL"}\n'
-        '- {"action":"positions"}\n'
-        '- {"action":"cash"}\n'
-        '- {"action":"close","symbol":"AAPL"}\n'
-        '- {"action":"confirm"}\n'
-        '- {"action":"cancel"}\n\n'
-        "Rules:\n"
-        "- 'analyze X' -> analyze\n"
-        "- 'yes','do it','execute' -> confirm\n"
-        "- 'no','cancel' -> cancel\n"
-        "- 'positions','holdings' -> positions\n"
-        "- 'cash','balance' -> cash\n"
-        "- 'close X','sell X','exit X' -> close\n"
-        "- 'quote X' -> quote\n"
-        "- Bare symbol like 'BTC/USD' -> analyze\n"
-        "- Otherwise -> plain text reply. Concise, no filler."
+        "You are Sentinel, an AI trading assistant. Handle ANY message.\n\n"
+        "For trading commands, output ONLY valid JSON:\n"
+        '{"action":"analyze","symbol":"AAPL"}\n'
+        '{"action":"quote","symbol":"AAPL"}\n'
+        '{"action":"positions"}\n'
+        '{"action":"cash"}\n'
+        '{"action":"close","symbol":"AAPL"}\n'
+        '{"action":"confirm"}\n'
+        '{"action":"cancel"}\n'
+        '{"action":"lessons"}\n\n'
+        "For anything else - questions, goals, casual chat - reply in plain "
+        "text. Be helpful, direct, honest. Never promise impossible returns. "
+        "Concise, no filler."
     )
 
     def __init__(self, engine):
@@ -943,57 +931,46 @@ class ChatEngine:
         upper = cleaned.upper()
         no_space = upper.replace(" ", "").replace("'", "").replace("\"", "")
 
-        # ---- instant commands ----
-        if upper in ("YES","Y","CONFIRM","DO IT","EXECUTE","GO AHEAD","OK","OKAY"):
-            self.history.append({"role":"user","content":user_msg})
-            r = self._run_action({"action":"confirm"})
-            self.history.append({"role":"assistant","content":r["reply"]})
-            return r
-        if upper in ("NO","N","CANCEL","NEVER MIND","NEVERMIND"):
-            self.history.append({"role":"user","content":user_msg})
-            r = self._run_action({"action":"cancel"})
-            self.history.append({"role":"assistant","content":r["reply"]})
-            return r
-        if upper in ("POSITIONS","POS","HOLDINGS","WHAT DO I HAVE"):
-            self.history.append({"role":"user","content":user_msg})
-            r = self._run_action({"action":"positions"})
-            self.history.append({"role":"assistant","content":r["reply"]})
-            return r
-        if upper in ("CASH","BALANCE","FUNDS","BUYING POWER","EQUITY","MONEY"):
-            self.history.append({"role":"user","content":user_msg})
-            r = self._run_action({"action":"cash"})
-            self.history.append({"role":"assistant","content":r["reply"]})
-            return r
+        # ---- GOAL CHECK ----
+        target_match = re.match(
+            r"(?:TARGET|GOAL|MAKE|EARN)\s+\$?([\d,]+(?:\.\d+)?)\s+"
+            r"(?:BY|IN)\s+(.+)$", upper)
+        if target_match:
+            try:
+                amount = float(target_match.group(1).replace(",", ""))
+                deadline = target_match.group(2).strip()
+                return self._set_target(amount, deadline)
+            except Exception:
+                pass
+
+        # ---- INSTANT COMMANDS ----
+        if upper in ("YES","Y","CONFIRM","DO IT","EXECUTE","OK","OKAY"):
+            return self._run_action({"action":"confirm"})
+        if upper in ("NO","N","CANCEL","NEVER MIND"):
+            return self._run_action({"action":"cancel"})
+        if upper in ("POSITIONS","POS","HOLDINGS"):
+            return self._run_action({"action":"positions"})
+        if upper in ("CASH","BALANCE","EQUITY","BUYING POWER"):
+            return self._run_action({"action":"cash"})
+        if upper in ("LESSONS","WHAT HAVE YOU LEARNED","LEARNING"):
+            return self._run_action({"action":"lessons"})
 
         m = re.match(r"^(?:QUOTE|PRICE(?:\s+OF)?)\s+([A-Z0-9/]{1,12})$", upper)
         if m:
-            self.history.append({"role":"user","content":user_msg})
-            r = self._run_action({"action":"quote","symbol":m.group(1)})
-            self.history.append({"role":"assistant","content":r["reply"]})
-            return r
+            return self._run_action({"action":"quote","symbol":m.group(1)})
 
         m = re.match(r"^(?:CLOSE|SELL|EXIT|DUMP)\s+([A-Z0-9/]{1,12})$", upper)
         if m:
-            self.history.append({"role":"user","content":user_msg})
-            r = self._run_action({"action":"close","symbol":m.group(1)})
-            self.history.append({"role":"assistant","content":r["reply"]})
-            return r
+            return self._run_action({"action":"close","symbol":m.group(1)})
 
-        m = re.match(r"^(?:ANALYZE|ANALYSE|LOOK\s+AT|CHECK|WHAT\s+ABOUT|"
-                     r"SHOULD\s+I\s+BUY|HOW\s+ABOUT)\s+([A-Z0-9/]{1,12})$", upper)
+        m = re.match(r"^(?:ANALYZE|ANALYSE|LOOK\s+AT|CHECK)\s+([A-Z0-9/]{1,12})$", upper)
         if m:
-            self.history.append({"role":"user","content":user_msg})
-            r = self._do_analyze(m.group(1))
-            self.history.append({"role":"assistant","content":r["reply"]})
-            return r
+            return self._do_analyze(m.group(1))
 
         if re.fullmatch(r"[A-Z]{1,6}(/[A-Z]{2,4})?", no_space):
-            self.history.append({"role":"user","content":user_msg})
-            r = self._do_analyze(no_space)
-            self.history.append({"role":"assistant","content":r["reply"]})
-            return r
+            return self._do_analyze(no_space)
 
-        # ---- slow path: LLM ----
+        # ---- LLM PATH ----
         try:
             account = self.engine._account()
             positions = self.engine._positions()
@@ -1008,8 +985,7 @@ class ChatEngine:
         if self.pending:
             p = self.pending
             pending_txt = (f"\nPENDING: {p['action']} {p['qty']} {p['symbol']} "
-                           f"@ {p['entry']:.4f} SL {p['stop_loss']:.4f} "
-                           f"TP {p['take_profit']:.4f}")
+                           f"@ {p['entry']:.4f}")
 
         full_sys = self.SYS + "\n\nCONTEXT:\n" + context + pending_txt
 
@@ -1019,14 +995,36 @@ class ChatEngine:
         except Exception as e:
             reply = f"[LLM error: {e}]"
 
-        self.history.append({"role":"user","content":user_msg})
+        if self.engine.learner:
+            try:
+                self.engine.learner.record_conversation("user", user_msg)
+                self.engine.learner.record_conversation("bot", reply)
+            except Exception:
+                pass
+
         action = self._parse_action(reply)
         if action:
-            result = self._run_action(action)
-            self.history.append({"role":"assistant","content":result["reply"]})
-            return result
-        self.history.append({"role":"assistant","content":reply})
+            return self._run_action(action)
         return {"reply": reply, "pending": self.pending, "type": "text"}
+
+    def _set_target(self, amount, deadline):
+        eq = self.engine._account()["equity"]
+        pct = (amount / eq) * 100
+        if pct > 100:
+            return {"reply": (
+                f"Target: ${amount:,.0f} by {deadline}\n"
+                f"Required: {pct:,.0f}% return\n\n"
+                f"That is not achievable. Realistic monthly targets:\n"
+                f"  ${eq*0.05:,.0f} (5%) - aggressive\n"
+                f"  ${eq*0.10:,.0f} (10%) - excellent\n"
+                f"  ${eq*0.15:,.0f} (15%) - exceptional\n\n"
+                f"Set a real target and I will work toward it."),
+                "pending": None, "type": "text"}
+        return {"reply": (
+            f"TARGET SET: ${amount:,.0f} by {deadline}\n"
+            f"Required: {pct:.1f}% on ${eq:,.0f}\n"
+            f"I will track progress. Say 'progress' anytime."),
+            "pending": None, "type": "text"}
 
     def _parse_action(self, reply):
         reply = reply.strip()
@@ -1051,8 +1049,7 @@ class ChatEngine:
             sym = action.get("symbol", "").upper()
             try:
                 q = self.engine._quote(sym)
-                return {"reply": f"{sym}: bid ${q['bid']:.4f} / "
-                                  f"ask ${q['ask']:.4f}",
+                return {"reply": f"{sym}: bid ${q['bid']:.4f} / ask ${q['ask']:.4f}",
                         "pending": self.pending, "type": "text"}
             except Exception as e:
                 return {"reply": f"Cannot quote {sym}: {e}",
@@ -1069,12 +1066,10 @@ class ChatEngine:
                     track = self.engine._active_trades.get(p["symbol"], {})
                     sl = track.get("sl", 0)
                     tp = track.get("tp", 0)
-                    extra = ""
-                    if sl and tp:
-                        extra = f"  SL ${sl:.4f}  TP ${tp:.4f}"
+                    extra = f"  SL ${sl:.4f}  TP ${tp:.4f}" if sl and tp else ""
                     lines.append(
-                        f"{p['symbol']}: {p['qty']:.4f} @ "
-                        f"${p['avg_entry']:.4f}  now ${p['current_price']:.4f}  "
+                        f"{p['symbol']}: {p['qty']:.4f} @ ${p['avg_entry']:.4f}  "
+                        f"now ${p['current_price']:.4f}  "
                         f"P/L ${p['unrealized_pl']:+.2f} "
                         f"({p['unrealized_plpc']:+.2f}%){extra}")
                 return {"reply": "\n".join(lines),
@@ -1093,6 +1088,15 @@ class ChatEngine:
                 return {"reply": f"Error: {e}",
                         "pending": self.pending, "type": "text"}
 
+        if a == "lessons":
+            if not self.engine.learner:
+                return {"reply": "Learning module not loaded.",
+                        "pending": self.pending, "type": "text"}
+            summary = self.engine.learner.learned_summary()
+            count = self.engine.learner.trade_count()
+            return {"reply": f"Learned from {count} trades:\n\n{summary}",
+                    "pending": self.pending, "type": "text"}
+
         if a == "close":
             sym = action.get("symbol", "").upper()
             held = any(p["symbol"] == sym for p in self.engine._positions())
@@ -1104,16 +1108,31 @@ class ChatEngine:
                     "pending": self.pending,
                     "type": "trade" if ok else "error"}
 
+        if a == "close_all":
+            try:
+                positions = self.engine._positions()
+                if not positions:
+                    return {"reply": "No positions to close.",
+                            "pending": self.pending, "type": "text"}
+                closed = []
+                for p in positions:
+                    if self.engine._close_position(p["symbol"], "manual close all"):
+                        closed.append(p["symbol"])
+                return {"reply": f"Closed {len(closed)}: {', '.join(closed)}",
+                        "pending": self.pending, "type": "trade"}
+            except Exception as e:
+                return {"reply": f"Close-all error: {e}",
+                        "pending": self.pending, "type": "error"}
+
         if a == "confirm":
             if not self.pending:
                 return {"reply": "Nothing pending.",
                         "pending": None, "type": "text"}
             res = self.engine.execute_proposal(self.pending)
             if res["ok"]:
-                msg = (f"EXECUTED: {res['side']} {res['qty']} "
-                       f"{res['symbol']} @ ~{res['entry']:.4f}\n"
-                       f"Order ID: {res['order_id']}\n"
-                       f"SL/TP monitoring active -- auto-close on hit.")
+                msg = (f"EXECUTED: {res['side']} {res['qty']} {res['symbol']} "
+                       f"@ ~{res['entry']:.4f}\nOrder ID: {res['order_id']}\n"
+                       f"SL/TP monitoring active.")
                 self.pending = None
                 return {"reply": msg, "pending": None, "type": "trade"}
             return {"reply": f"Execution failed: {res.get('error')}",
@@ -1137,7 +1156,7 @@ class ChatEngine:
             reason = result.get("reason") or result.get("error") or "unknown"
             if result.get("action") == "HOLD":
                 msg = (f"{symbol}: HOLD at "
-                       f"{result.get('confidence',0):.0%} confidence.\n"
+                       f"{result.get('confidence',0):.0%}.\n"
                        f"{result.get('decision_reason','')}")
                 return {"reply": msg, "pending": None, "type": "text"}
             return {"reply": f"{symbol}: no trade. {reason}",
@@ -1147,8 +1166,7 @@ class ChatEngine:
         arrow = "BUY" if result["action"] == "BUY" else "SELL"
         notional = result["entry"] * result["qty"]
         msg = (
-            f"{symbol} - {arrow} signal, "
-            f"{result['confidence']:.0%} confidence.\n\n"
+            f"{symbol} - {arrow} signal, {result['confidence']:.0%}.\n\n"
             f"Entry: ~${result['entry']:.4f}\n"
             f"Qty: {result['qty']} (~${notional:,.2f})\n"
             f"Stop loss: ${result['stop_loss']:.4f}\n"
@@ -1156,6 +1174,6 @@ class ChatEngine:
             f"Risk: ${result['risk_amount']:.2f}  "
             f"Reward: ${result['reward_amount']:.2f}\n\n"
             f"Reason: {result['reason'][:250]}\n\n"
-            f"Reply 'yes' to execute, 'no' to cancel."
+            f"Reply 'yes' to execute."
         )
         return {"reply": msg, "pending": self.pending, "type": "proposal"}

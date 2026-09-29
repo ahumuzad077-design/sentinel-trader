@@ -1,6 +1,7 @@
-﻿alpaca-py
+alpaca-py
 openai
 python-dotenv
 numpy
 flask
 gunicorn
+youtube-transcript-api

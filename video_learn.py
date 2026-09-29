@@ -1,8 +1,6 @@
 """Sentinel video learning - reads YouTube transcripts, extracts trading rules.
 
-Compatible with youtube-transcript-api versions:
-- 0.6.x (older: get_transcript, list_transcripts)
-- 1.x (newer: YouTubeTranscriptApi().fetch())
+Uses youtube-transcript-api v1.x (instance-based fetch method).
 """
 
 import re
@@ -18,12 +16,14 @@ except ImportError:
 def extract_video_id(url):
     m = re.search(
         r"(?:youtube\.com/watch\?v=|youtu\.be/|youtube\.com/shorts/|"
-        r"youtube\.com/embed/)([A-Za-z0-9_-]{11})", url)
-    return m.group(1) if m else None
+        r"youtube\.com/embed/)([A-Za-z0-9_-]{10,12})", url)
+    if not m:
+        return None
+    vid = m.group(1)
+    return vid
 
 
 def _snippets_to_text(snippets):
-    """Convert various snippet formats to plain text."""
     parts = []
     for item in snippets:
         if isinstance(item, dict):
@@ -37,71 +37,40 @@ def _snippets_to_text(snippets):
 
 
 def fetch_transcript(video_id):
-    """Try every known API surface. Return (text, error)."""
+    """Return (text, error). Uses v1.x API."""
     if not HAS_YT:
         return None, "youtube-transcript-api not installed"
 
-    # ---- API 1.x: instance method ----
+    # ---- v1.x: instance-based fetch() ----
     try:
         api = YouTubeTranscriptApi()
-        if hasattr(api, "fetch"):
-            try:
-                result = api.fetch(video_id,
-                                     languages=["en", "en-US", "en-GB"])
-            except Exception:
-                result = api.fetch(video_id)
-
-            # FetchedTranscript object — has .snippets or is iterable
-            if hasattr(result, "snippets"):
-                snippets = result.snippets
-            elif hasattr(result, "to_raw_data"):
-                snippets = result.to_raw_data()
-            else:
-                snippets = list(result)
-            text = _snippets_to_text(snippets)
-            if text:
-                return text, None
-    except Exception:
-        pass
-
-    # ---- API 0.6.x: class method get_transcript ----
-    if hasattr(YouTubeTranscriptApi, "get_transcript"):
-        try:
-            data = YouTubeTranscriptApi.get_transcript(
-                video_id, languages=["en", "en-US", "en-GB"])
-            text = _snippets_to_text(data)
-            if text:
-                return text, None
-        except Exception as e:
-            err1 = str(e)
+        fetched = api.fetch(video_id)
+        # FetchedTranscript object — access .snippets
+        if hasattr(fetched, "snippets"):
+            text = _snippets_to_text(fetched.snippets)
         else:
-            err1 = None
+            text = _snippets_to_text(list(fetched))
+        if text:
+            return text, None
+        return None, "empty transcript"
+    except Exception as e:
+        err_v1 = f"{type(e).__name__}: {e}"
+
+    # ---- v0.6.x fallback ----
+    if hasattr(YouTubeTranscriptApi, "get_transcript"):
         try:
             data = YouTubeTranscriptApi.get_transcript(video_id)
             text = _snippets_to_text(data)
             if text:
                 return text, None
         except Exception as e:
-            err2 = str(e)
-        return None, f"{err1 or err2}"
+            err_v06 = f"{type(e).__name__}: {e}"
+        else:
+            err_v06 = None
+    else:
+        err_v06 = "get_transcript not available"
 
-    # ---- API 0.6.x: list_transcripts fallback ----
-    if hasattr(YouTubeTranscriptApi, "list_transcripts"):
-        try:
-            transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
-            for t in transcript_list:
-                try:
-                    data = t.fetch()
-                    text = _snippets_to_text(data)
-                    if text:
-                        return text, None
-                except Exception:
-                    continue
-            return None, "no fetchable transcript found"
-        except Exception as e:
-            return None, str(e)
-
-    return None, "no compatible youtube-transcript-api method found"
+    return None, f"v1.x error: {err_v1} | v0.6.x error: {err_v06}"
 
 
 def chunk_text(text, max_chars=12000):

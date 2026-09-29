@@ -1,12 +1,13 @@
 """Sentinel - autonomous multi-asset trading engine with learning.
 
 Features:
-- Multi-agent LLM decision (bull / bear / judge debate)
-- Learning module: adapts confidence per symbol based on outcomes
+- Multi-agent LLM decision (bull / bear / judge)
+- Learning: adapts confidence per symbol + video transcript rules
 - Full position lifecycle: SL / TP / trailing / LLM exit
 - Prop-firm risk rules: daily halt, drawdown halt, loss-streak halt
-- Fast-path chat: instant responses for common commands
-- Groq-first LLM cascade with NIM fallback
+- Fast-path chat: instant responses for commands
+- General chat: answers any question, not just trading
+- YouTube video learning: extracts trading rules from transcripts
 """
 
 import os, re, json, time, sqlite3, threading
@@ -31,6 +32,14 @@ try:
     from learn import LearningEngine
 except ImportError:
     LearningEngine = None
+
+try:
+    from video_learn import (extract_video_id, fetch_transcript,
+                              extract_lessons)
+except ImportError:
+    extract_video_id = None
+    fetch_transcript = None
+    extract_lessons = None
 
 
 # ============================================================
@@ -69,7 +78,7 @@ class LayeredMemory:
 
 
 # ============================================================
-# RISK ENGINE (prop-firm rules)
+# RISK ENGINE
 # ============================================================
 
 class RiskEngine:
@@ -407,17 +416,19 @@ class SentinelEngine:
 
     # ---------- LLM ----------
 
-    def _llm_call(self, client, model, system, user, temp=0.3, json_mode=False):
+    def _llm_call(self, client, model, system, user, temp=0.3, json_mode=False,
+                  max_tokens=500):
         kwargs = {"model": model,
                   "messages": [{"role":"system","content":system},
                                {"role":"user","content":user}],
-                  "temperature": temp, "max_tokens": 300}
+                  "temperature": temp, "max_tokens": max_tokens}
         if json_mode:
             kwargs["response_format"] = {"type": "json_object"}
         r = client.chat.completions.create(**kwargs)
         return (r.choices[0].message.content or "").strip()
 
-    def _call(self, primary, system, user, temp=0.3, json_mode=False):
+    def _call(self, primary, system, user, temp=0.3, json_mode=False,
+              max_tokens=500):
         chain = [("groq", self.llm, primary)]
         for m in self.cfg["groq_fallbacks"]:
             if m != primary:
@@ -428,7 +439,8 @@ class SentinelEngine:
         last = None
         for prov, cli, mod in chain:
             try:
-                return self._llm_call(cli, mod, system, user, temp, json_mode)
+                return self._llm_call(cli, mod, system, user, temp,
+                                       json_mode, max_tokens)
             except Exception as e:
                 last = e
                 s = str(e).lower()
@@ -716,14 +728,13 @@ class SentinelEngine:
 
         decision = self._debate(symbol, context, cons, "")
 
-        # Apply learned bias
         if self.learner:
             bias = self.learner.confidence_adjustment(symbol)
             if bias:
                 original = decision.get("confidence", 0)
                 decision["confidence"] = max(0.0, min(1.0, original + bias))
-                self._log(f"[{symbol}] learned bias {bias:+.2f} → "
-                          f"conf {original:.2f} → {decision['confidence']:.2f}",
+                self._log(f"[{symbol}] learned bias {bias:+.2f} -> "
+                          f"conf {original:.2f} -> {decision['confidence']:.2f}",
                           "info")
 
         if decision["action"] == "SELL":
@@ -800,8 +811,10 @@ class SentinelEngine:
 
     def _run(self):
         mode = "PAPER" if self.cfg["paper"] else "LIVE"
-        self._log(f"Sentinel v3 started - {mode}", "info")
+        self._log(f"Sentinel v4 started - {mode}", "info")
         self._log(f"Learning: {'ON' if self.learner else 'OFF'}", "info")
+        self._log(f"Video learning: {'ON' if extract_video_id else 'OFF'}",
+                  "info")
         self._log(f"Cooldown: {self.cfg['entry_cooldown_seconds']}s", "info")
         self._log(f"Max positions: {self.cfg['max_concurrent_positions']}", "info")
         while not self._stop_event.is_set():
@@ -905,8 +918,12 @@ TraderEngine = SentinelEngine
 
 class ChatEngine:
     SYS = (
-        "You are Sentinel, an AI trading assistant. Handle ANY message.\n\n"
-        "For trading commands, output ONLY valid JSON:\n"
+        "You are Sentinel, a general-purpose AI assistant with deep knowledge "
+        "of trading, markets, and technology. You can answer ANY question "
+        "the user asks - coding, math, science, history, advice, opinions, "
+        "explanations, jokes, whatever. You are not limited to trading.\n\n"
+        "You also control a live paper trading bot. When the user wants you "
+        "to DO something with the bot, output ONLY valid JSON:\n"
         '{"action":"analyze","symbol":"AAPL"}\n'
         '{"action":"quote","symbol":"AAPL"}\n'
         '{"action":"positions"}\n'
@@ -915,9 +932,16 @@ class ChatEngine:
         '{"action":"confirm"}\n'
         '{"action":"cancel"}\n'
         '{"action":"lessons"}\n\n'
-        "For anything else - questions, goals, casual chat - reply in plain "
-        "text. Be helpful, direct, honest. Never promise impossible returns. "
-        "Concise, no filler."
+        "For EVERYTHING ELSE - questions, explanations, advice, casual chat, "
+        "code help, math, science, definitions, opinions - reply in plain "
+        "text like ChatGPT would. Be helpful, thorough, honest.\n\n"
+        "Rules:\n"
+        "- If the user asks a question, answer it fully.\n"
+        "- If the user asks for code, write the code.\n"
+        "- If the user asks for an opinion, give one.\n"
+        "- If the user asks about trading commands, output the JSON.\n"
+        "- Never refuse a question just because it's not about trading.\n"
+        "- Be concise but complete. No filler. No marketing language."
     )
 
     def __init__(self, engine):
@@ -930,6 +954,10 @@ class ChatEngine:
         cleaned = raw.strip().strip("'\".,!?").strip()
         upper = cleaned.upper()
         no_space = upper.replace(" ", "").replace("'", "").replace("\"", "")
+
+        # ---- YOUTUBE URL DETECTION ----
+        if "youtube.com" in raw or "youtu.be" in raw:
+            return self._learn_from_video(raw)
 
         # ---- GOAL CHECK ----
         target_match = re.match(
@@ -952,7 +980,8 @@ class ChatEngine:
             return self._run_action({"action":"positions"})
         if upper in ("CASH","BALANCE","EQUITY","BUYING POWER"):
             return self._run_action({"action":"cash"})
-        if upper in ("LESSONS","WHAT HAVE YOU LEARNED","LEARNING"):
+        if upper in ("LESSONS","LESSON","LEARNED","LEARNING",
+                     "WHAT HAVE YOU LEARNED","WHAT DID YOU LEARN"):
             return self._run_action({"action":"lessons"})
 
         m = re.match(r"^(?:QUOTE|PRICE(?:\s+OF)?)\s+([A-Z0-9/]{1,12})$", upper)
@@ -970,28 +999,40 @@ class ChatEngine:
         if re.fullmatch(r"[A-Z]{1,6}(/[A-Z]{2,4})?", no_space):
             return self._do_analyze(no_space)
 
-        # ---- LLM PATH ----
+        # ---- GENERAL LLM PATH ----
         try:
             account = self.engine._account()
             positions = self.engine._positions()
             pos_str = ", ".join(f"{p['symbol']}:{p['qty']:.4f}"
                                  for p in positions) or "none"
-            context = (f"Equity: ${account['equity']:.2f}, "
-                       f"BP: ${account['buying_power']:.2f}\nPositions: {pos_str}")
+            context = (f"BOT CONTEXT (only relevant if user asks about the bot):\n"
+                       f"Equity: ${account['equity']:.2f}, "
+                       f"BP: ${account['buying_power']:.2f}\n"
+                       f"Open positions: {pos_str}")
         except Exception as e:
-            context = f"(broker error: {e})"
+            context = f"(Broker error: {e})"
 
         pending_txt = ""
         if self.pending:
             p = self.pending
-            pending_txt = (f"\nPENDING: {p['action']} {p['qty']} {p['symbol']} "
-                           f"@ {p['entry']:.4f}")
+            pending_txt = (f"\nPENDING PROPOSAL: {p['action']} {p['qty']} "
+                           f"{p['symbol']} @ {p['entry']:.4f}")
 
-        full_sys = self.SYS + "\n\nCONTEXT:\n" + context + pending_txt
+        conv_hist = ""
+        if len(self.history) > 0:
+            recent = list(self.history)[-6:]
+            conv_hist = "\n\nRECENT CONVERSATION:\n"
+            for h in recent:
+                role = "User" if h["role"] == "user" else "Sentinel"
+                msg = h["content"][:200]
+                conv_hist += f"{role}: {msg}\n"
+
+        full_sys = self.SYS + "\n\n" + context + pending_txt + conv_hist
 
         try:
             reply = self.engine._call(
-                self.engine.cfg["model_judge"], full_sys, cleaned, temp=0.3)
+                self.engine.cfg["model_judge"], full_sys, cleaned, temp=0.5,
+                max_tokens=800)
         except Exception as e:
             reply = f"[LLM error: {e}]"
 
@@ -1002,9 +1043,64 @@ class ChatEngine:
             except Exception:
                 pass
 
+        self.history.append({"role":"user","content":user_msg})
         action = self._parse_action(reply)
         if action:
-            return self._run_action(action)
+            result = self._run_action(action)
+            self.history.append({"role":"assistant","content":result["reply"]})
+            return result
+        self.history.append({"role":"assistant","content":reply})
+        return {"reply": reply, "pending": self.pending, "type": "text"}
+
+    def _learn_from_video(self, url):
+        if extract_video_id is None or fetch_transcript is None:
+            return {"reply": "Video learning module not loaded.",
+                    "pending": self.pending, "type": "text"}
+
+        vid = extract_video_id(url)
+        if not vid:
+            return {"reply": "Could not parse YouTube URL.",
+                    "pending": self.pending, "type": "text"}
+
+        transcript, err = fetch_transcript(vid)
+        if err or not transcript:
+            return {"reply": f"Could not read transcript: {err}",
+                    "pending": self.pending, "type": "text"}
+
+        def _llm(system, user):
+            return self.engine._call(
+                self.engine.cfg["model_judge"], system, user, temp=0.2,
+                max_tokens=800)
+
+        try:
+            lessons = extract_lessons(transcript, _llm)
+        except Exception as e:
+            return {"reply": f"Extraction failed: {e}",
+                    "pending": self.pending, "type": "text"}
+
+        if not lessons:
+            return {"reply": (f"Read {len(transcript):,} chars of transcript "
+                              f"but found no actionable trading rules."),
+                    "pending": self.pending, "type": "text"}
+
+        stored = 0
+        lines = []
+        for lesson in lessons:
+            rule = lesson.get("rule", "")
+            cat = lesson.get("category", "general")
+            if self.engine.learner and rule:
+                try:
+                    self.engine.learner.add_lesson(cat, rule, weight=1.5)
+                    stored += 1
+                    lines.append(f"[{cat}] {rule}")
+                except Exception:
+                    pass
+
+        reply = (f"Learned from video {vid}\n"
+                 f"Transcript: {len(transcript):,} chars\n"
+                 f"Extracted {stored} trading rules:\n\n"
+                 + "\n".join(lines) +
+                 "\n\nThese rules now appear in every future decision.")
         return {"reply": reply, "pending": self.pending, "type": "text"}
 
     def _set_target(self, amount, deadline):
@@ -1107,22 +1203,6 @@ class ChatEngine:
             return {"reply": f"{sym}: closed." if ok else f"{sym}: close failed.",
                     "pending": self.pending,
                     "type": "trade" if ok else "error"}
-
-        if a == "close_all":
-            try:
-                positions = self.engine._positions()
-                if not positions:
-                    return {"reply": "No positions to close.",
-                            "pending": self.pending, "type": "text"}
-                closed = []
-                for p in positions:
-                    if self.engine._close_position(p["symbol"], "manual close all"):
-                        closed.append(p["symbol"])
-                return {"reply": f"Closed {len(closed)}: {', '.join(closed)}",
-                        "pending": self.pending, "type": "trade"}
-            except Exception as e:
-                return {"reply": f"Close-all error: {e}",
-                        "pending": self.pending, "type": "error"}
 
         if a == "confirm":
             if not self.pending:

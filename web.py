@@ -1,6 +1,7 @@
-﻿"""Sentinel - web server."""
+"""Sentinel - web server."""
 
 import os
+import json
 import threading
 from collections import deque
 from datetime import datetime
@@ -8,6 +9,11 @@ from datetime import datetime
 from flask import Flask, render_template, jsonify, request
 
 from bot import TraderEngine, ChatEngine
+
+try:
+    from stats import compute_stats
+except ImportError:
+    compute_stats = None
 
 app = Flask(__name__)
 
@@ -23,11 +29,30 @@ _engine = None
 _chat = None
 
 
+def _clean(obj):
+    """Recursively convert any object into JSON-safe primitives."""
+    if obj is None:
+        return None
+    if isinstance(obj, (str, int, float, bool)):
+        if isinstance(obj, float):
+            if obj != obj or obj == float("inf") or obj == float("-inf"):
+                return None
+        return obj
+    if isinstance(obj, dict):
+        return {str(k): _clean(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple, set)):
+        return [_clean(x) for x in obj]
+    if hasattr(obj, "isoformat"):
+        return obj.isoformat()
+    return str(obj)
+
+
 def _on_log(msg, level):
     with _lock:
         _log_buffer.append({
             "ts": datetime.now().strftime("%H:%M:%S"),
-            "msg": msg, "level": level})
+            "msg": str(msg),
+            "level": str(level)})
 
 
 def _on_status(d):
@@ -35,17 +60,16 @@ def _on_status(d):
         for k in ("equity", "buying_power", "positions", "cycle",
                   "halted", "halt_reason", "mode", "equity_curve"):
             if k in d:
-                _state[k] = d[k]
+                _state[k] = _clean(d[k])
 
 
 def _on_bars(symbol, bars, trade):
     with _lock:
-        _state["bars"][symbol] = bars
-        _state["trades"][symbol] = trade
+        _state["bars"][str(symbol)] = _clean(bars)
+        _state["trades"][str(symbol)] = _clean(trade)
 
 
 def _ensure_engine():
-    """Create the engine + chat if they don't exist yet."""
     global _engine, _chat
     if _engine is None:
         _engine = TraderEngine(
@@ -63,7 +87,23 @@ def index():
 @app.route("/api/state")
 def api_state():
     with _lock:
-        return jsonify({**_state, "log": list(_log_buffer)[-200:]})
+        payload = {**_state, "log": list(_log_buffer)[-200:]}
+    return jsonify(_clean(payload))
+
+
+@app.route("/api/stats")
+def api_stats():
+    if compute_stats is None:
+        return jsonify({"error": "stats module not loaded"})
+    try:
+        path = os.environ.get("JOURNAL_PATH", "trades.db")
+        s = compute_stats(path)
+        # Convert inf to string so JSON doesn't choke
+        if s.get("profit_factor") == float("inf"):
+            s["profit_factor"] = "inf"
+        return jsonify(_clean(s))
+    except Exception as e:
+        return jsonify({"error": str(e)})
 
 
 @app.route("/api/start", methods=["POST"])
@@ -89,7 +129,7 @@ def api_stop():
 def api_chat():
     engine, chat = _ensure_engine()
     data = request.get_json(silent=True) or {}
-    msg = (data.get("message") or "").strip()
+    msg = str(data.get("message") or "").strip()
     if not msg:
         return jsonify({"reply": "", "type": "text"})
 
@@ -100,7 +140,25 @@ def api_chat():
         traceback.print_exc()
         result = {"reply": f"Chat error: {e}", "type": "error"}
 
-    return jsonify(result)
+    if not isinstance(result, dict):
+        result = {"reply": str(result), "type": "text"}
+
+    reply = result.get("reply", "")
+    if not isinstance(reply, str):
+        try:
+            reply = json.dumps(_clean(reply), indent=2)
+        except Exception:
+            reply = str(reply)
+
+    pending = result.get("pending")
+    if pending is not None:
+        pending = _clean(pending)
+
+    return jsonify({
+        "reply": reply,
+        "pending": pending,
+        "type": str(result.get("type", "text")),
+    })
 
 
 def _deferred_start():

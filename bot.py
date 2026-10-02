@@ -1,13 +1,13 @@
 """Sentinel - autonomous multi-asset trading engine with learning.
 
 Features:
-- Multi-agent LLM decision (bull / bear / judge)
+- Multi-agent LLM decision (bull / bear / judge debate)
 - Learning: adapts confidence per symbol + video transcript rules
 - Full position lifecycle: SL / TP / trailing / LLM exit
 - Prop-firm risk rules: daily halt, drawdown halt, loss-streak halt
 - Fast-path chat: instant responses for commands
+- Handles array responses from LLM (close all positions)
 - General chat: answers any question, not just trading
-- YouTube video learning: extracts trading rules from transcripts
 """
 
 import os, re, json, time, sqlite3, threading
@@ -224,7 +224,7 @@ def load_config():
         return v
 
     gf = [m.strip() for m in
-          get("GROQ_FALLBACKS", "openai/gpt-oss-20b").split(",") if m.strip()]
+          get("GROQ_FALLBACKS", "qwen/qwen3.8-27b").split(",") if m.strip()]
     nf = [m.strip() for m in
           get("NIM_FALLBACKS",
               "deepseek-ai/deepseek-v4.1-flash,"
@@ -246,11 +246,11 @@ def load_config():
         "crypto_symbols": [s.strip().upper() for s in
                            get("CRYPTO_SYMBOLS", "BTC/USD,ETH/USD").split(",")
                            if s.strip()],
-        "cycle_seconds": int(get("CYCLE_SECONDS", "1800")),
+        "cycle_seconds": int(get("CYCLE_SECONDS", "3600")),
         "entry_cooldown_seconds": int(get("ENTRY_COOLDOWN_SECONDS", "3600")),
         "research_every_n": int(get("RESEARCH_EVERY_N", "20")),
-        "screen_top_stocks": int(get("SCREEN_TOP_STOCKS", "10")),
-        "screen_top_crypto": int(get("SCREEN_TOP_CRYPTO", "3")),
+        "screen_top_stocks": int(get("SCREEN_TOP_STOCKS", "5")),
+        "screen_top_crypto": int(get("SCREEN_TOP_CRYPTO", "2")),
         "max_position_pct": float(get("MAX_POSITION_PCT", "0.03")),
         "max_daily_loss_pct": float(get("MAX_DAILY_LOSS_PCT", "0.02")),
         "max_total_drawdown_pct": float(get("MAX_TOTAL_DRAWDOWN_PCT", "0.06")),
@@ -811,7 +811,7 @@ class SentinelEngine:
 
     def _run(self):
         mode = "PAPER" if self.cfg["paper"] else "LIVE"
-        self._log(f"Sentinel v4 started - {mode}", "info")
+        self._log(f"Sentinel v4.1 started - {mode}", "info")
         self._log(f"Learning: {'ON' if self.learner else 'OFF'}", "info")
         self._log(f"Video learning: {'ON' if extract_video_id else 'OFF'}",
                   "info")
@@ -913,7 +913,7 @@ TraderEngine = SentinelEngine
 
 
 # ============================================================
-# CHAT ENGINE
+# CHAT ENGINE (with array action support)
 # ============================================================
 
 class ChatEngine:
@@ -929,9 +929,14 @@ class ChatEngine:
         '{"action":"positions"}\n'
         '{"action":"cash"}\n'
         '{"action":"close","symbol":"AAPL"}\n'
+        '{"action":"close_all"}\n'
         '{"action":"confirm"}\n'
         '{"action":"cancel"}\n'
         '{"action":"lessons"}\n\n'
+        "If the user asks to close MULTIPLE positions, output a JSON array:\n"
+        '[{"action":"close","symbol":"AAPL"},{"action":"close","symbol":"MSFT"}]\n'
+        "If the user asks to close ALL positions, output: "
+        '{"action":"close_all"}\n\n'
         "For EVERYTHING ELSE - questions, explanations, advice, casual chat, "
         "code help, math, science, definitions, opinions - reply in plain "
         "text like ChatGPT would. Be helpful, thorough, honest.\n\n"
@@ -948,6 +953,7 @@ class ChatEngine:
         self.engine = engine
         self.history = deque(maxlen=30)
         self.pending = None
+        self._pending_batch = []
 
     def handle(self, user_msg):
         raw = user_msg.strip()
@@ -983,6 +989,9 @@ class ChatEngine:
         if upper in ("LESSONS","LESSON","LEARNED","LEARNING",
                      "WHAT HAVE YOU LEARNED","WHAT DID YOU LEARN"):
             return self._run_action({"action":"lessons"})
+        if upper in ("CLOSE ALL","CLOSE ALL POSITIONS","CLOSE EVERYTHING",
+                     "SELL ALL","EXIT ALL","LIQUIDATE ALL","FLATTEN"):
+            return self._run_action({"action":"close_all"})
 
         m = re.match(r"^(?:QUOTE|PRICE(?:\s+OF)?)\s+([A-Z0-9/]{1,12})$", upper)
         if m:
@@ -1124,18 +1133,43 @@ class ChatEngine:
 
     def _parse_action(self, reply):
         reply = reply.strip()
-        if not reply.startswith("{"):
+        if not reply:
             return None
+        clean = re.sub(r"```json|```", "", reply).strip()
+        if not clean:
+            return None
+        # Try direct JSON parse
         try:
-            clean = re.sub(r"```json|```", "", reply).strip()
             d = json.loads(clean)
-            if "action" in d:
-                return d
         except Exception:
-            pass
+            # Try to find JSON object or array in the text
+            m = re.search(r"(\{.*\}|\[.*\])", clean, re.DOTALL)
+            if not m:
+                return None
+            try:
+                d = json.loads(m.group(1))
+            except Exception:
+                return None
+        # Handle array of actions
+        if isinstance(d, list):
+            if not d:
+                return None
+            # Queue remaining actions for subsequent calls
+            self._pending_batch = d[1:] if len(d) > 1 else []
+            return d[0]
+        if isinstance(d, dict) and "action" in d:
+            return d
         return None
 
     def _run_action(self, action):
+        # If called with no action and we have a pending batch, take next
+        if not action and self._pending_batch:
+            action = self._pending_batch.pop(0)
+
+        if not action:
+            return {"reply": "No action to run.",
+                    "pending": self.pending, "type": "text"}
+
         a = action.get("action", "").lower()
 
         if a == "analyze":
@@ -1203,6 +1237,28 @@ class ChatEngine:
             return {"reply": f"{sym}: closed." if ok else f"{sym}: close failed.",
                     "pending": self.pending,
                     "type": "trade" if ok else "error"}
+
+        if a == "close_all":
+            try:
+                positions = self.engine._positions()
+                if not positions:
+                    return {"reply": "No positions to close.",
+                            "pending": self.pending, "type": "text"}
+                closed = []
+                failed = []
+                for p in positions:
+                    sym = p["symbol"]
+                    if self.engine._close_position(sym, "manual close all"):
+                        closed.append(sym)
+                    else:
+                        failed.append(sym)
+                msg = f"Closed {len(closed)}: {', '.join(closed)}"
+                if failed:
+                    msg += f"\nFailed: {', '.join(failed)}"
+                return {"reply": msg, "pending": self.pending, "type": "trade"}
+            except Exception as e:
+                return {"reply": f"Close-all error: {e}",
+                        "pending": self.pending, "type": "error"}
 
         if a == "confirm":
             if not self.pending:

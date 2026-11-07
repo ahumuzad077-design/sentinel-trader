@@ -2,24 +2,21 @@
 
 Sentinel is an experimental trading dashboard and automated trading prototype. It is **not certified for any prop-firm evaluation**, does not promise profits, and should not be pointed at a funded/live account without a firm-specific rule review and end-to-end testing.
 
-## Secure dashboard deployment
+## Public dashboard deployment
 
-The dashboard and all API routes require HTTP Basic Authentication. Configure both of these environment variables in the Render service before using the app:
+The dashboard and API routes are intentionally public: **anyone with the Render URL can view the page and use its trading controls**. There is no password gate. Do not treat the URL as a secret or rely on it to protect account data or orders. Keep Render HTTPS enabled; non-HTTPS requests are rejected, and state-changing requests require a same-origin `Origin` or `Referer` header. These checks do not stop a person visiting the public dashboard directly.
 
-- `DASHBOARD_USERNAME`: a unique dashboard username.
-- `DASHBOARD_PASSWORD`: a long, random password (use a password manager).
+For safety, `AUTO_START=true` alone is ignored in public mode; automatic startup requires the additional `ALLOW_PUBLIC_AUTO_START=true`. The dashboard's Start control remains available and asks for explicit confirmation. Do not enable public auto-start unless you intentionally want the trading worker to run after every restart.
 
-Set them in Render's protected Environment settings—never commit them, include them in a Docker image, or send them in a URL. Without both values, the app denies dashboard/API access. Protected routes also reject plain HTTP; the app trusts one forwarded-protocol value from Render's TLS-terminating edge. Do not expose the WSGI listener directly or copy this proxy trust setting to an environment with a different proxy topology without reviewing it. `/healthz` remains unauthenticated and returns only `{ "ok": true }`.
+The container runs as an unprivileged user. Its SQLite trade journal defaults to `/var/lib/sentinel/trades.db`, with a writable fallback working directory for configured relative journal paths. This location is local container storage and may be lost when Render replaces the instance; attach and configure a persistent disk if journal retention across restarts is required.
 
-The browser will request credentials when opening the dashboard. The dashboard's same-origin API calls use that authenticated session. Keep Render HTTPS enabled. `AUTO_START` should remain `false`; start/stop and chat controls are privileged operations.
-
-**Important:** these code changes are local to a review branch until deliberately published. The currently deployed Render app is not protected by them unless you deploy a reviewed build. The repository alone does not show whether an external authentication layer is already in front of the current deployment.
+`/healthz` remains a minimal unauthenticated liveness check that returns `{ "ok": true }`.
 
 ## Dashboard controls and display
 
 The dashboard is a responsive, same-origin interface with account summary cards, a high-DPI market chart, broker position table, closed-trade journal metrics, and an assistant/activity console. Account figures are blank until a broker snapshot arrives; the UI shows the age of the last snapshot rather than treating a reachable API as proof that account data is current. Journal metrics are descriptive and are not prop-firm drawdown, daily-loss, or rule-compliance calculations.
 
-Starting automation opens a mode-aware review. PAPER mode requires a confirmation click; LIVE mode additionally requires typing `START LIVE`, and the `/api/start` route enforces that acknowledgement server-side. Stopping the engine only stops automated scanning; it does not liquidate positions. Chat-generated entries and manual close/close-all requests are shown as expiring, position-specific proposals and are not submitted until explicitly confirmed. Close proposals are rejected if the position quantity changes before confirmation. These controls reduce accidental actions but do not replace broker-side protections, firm-specific risk validation, or monitoring.
+Starting automation opens a mode-aware review. PAPER mode requires a confirmation click; LIVE mode additionally requires typing `START LIVE`, and the `/api/start` route enforces that acknowledgement server-side. Stopping the engine only stops automated scanning; it does not liquidate positions. Chat-generated entries and manual close/close-all requests are shown as expiring, position-specific proposals and are not submitted until explicitly confirmed. Close proposals are rejected if the position quantity changes before confirmation. However, because the dashboard is public, any visitor can use these workflows; these confirmations are not authentication or access control. Use PAPER mode unless you fully accept that risk.
 
 ## Trading and risk limitations
 

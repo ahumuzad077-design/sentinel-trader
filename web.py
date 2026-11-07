@@ -1,13 +1,12 @@
-"""Sentinel dashboard API with fail-closed access control."""
+"""Sentinel public dashboard API with HTTPS and same-origin write safeguards."""
 
-import hmac
 import os
 import threading
 from collections import deque
 from datetime import datetime, timezone
 from urllib.parse import urlsplit
 
-from flask import Flask, jsonify, make_response, render_template, request, send_file
+from flask import Flask, jsonify, render_template, request, send_file
 from werkzeug.middleware.proxy_fix import ProxyFix
 from dotenv import load_dotenv
 
@@ -59,38 +58,14 @@ def _clean(obj):
     return str(obj)
 
 
-def _unauthorized(message="Authentication required."):
-    response = make_response(jsonify({"error": message}), 401)
-    response.headers["WWW-Authenticate"] = 'Basic realm="Sentinel", charset="UTF-8"'
-    response.headers["Cache-Control"] = "no-store"
-    return response
-
-
 @app.before_request
-def require_dashboard_auth():
-    """Protect every dashboard/API route; permit only minimal liveness checks."""
+def require_secure_same_origin():
+    """Require HTTPS and block cross-origin writes; app access is intentionally public."""
     if request.endpoint == "healthz":
         return None
 
-    expected_user = os.environ.get("DASHBOARD_USERNAME", "")
-    expected_password = os.environ.get("DASHBOARD_PASSWORD", "")
-    if not expected_user or not expected_password:
-        return _unauthorized("Dashboard credentials are not configured.")
     if not request.is_secure:
         return jsonify({"error": "HTTPS is required."}), 400
-
-    auth = request.authorization
-    if not auth or auth.type.lower() != "basic":
-        return _unauthorized()
-
-    supplied_user = auth.username or ""
-    supplied_password = auth.password or ""
-    user_ok = hmac.compare_digest(supplied_user.encode("utf-8"),
-                                  expected_user.encode("utf-8"))
-    password_ok = hmac.compare_digest(supplied_password.encode("utf-8"),
-                                      expected_password.encode("utf-8"))
-    if not (user_ok and password_ok):
-        return _unauthorized("Invalid credentials.")
 
     if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
         source = request.headers.get("Origin") or request.headers.get("Referer")
@@ -265,6 +240,13 @@ def api_chat():
     })
 
 
+def _public_auto_start_enabled():
+    return (
+        os.environ.get("AUTO_START", "false").lower() == "true"
+        and os.environ.get("ALLOW_PUBLIC_AUTO_START", "false").lower() == "true"
+    )
+
+
 def _deferred_start():
     import time
     time.sleep(3)
@@ -279,11 +261,12 @@ def _deferred_start():
 
 
 if os.environ.get("AUTO_START", "false").lower() == "true":
-    if (os.environ.get("DASHBOARD_USERNAME")
-            and os.environ.get("DASHBOARD_PASSWORD")):
+    if _public_auto_start_enabled():
         threading.Thread(target=_deferred_start, daemon=True).start()
     else:
-        app.logger.error("Ignoring AUTO_START because dashboard credentials are not configured")
+        app.logger.warning(
+            "Ignoring AUTO_START in public-access mode; start manually from the dashboard"
+        )
 
 
 if __name__ == "__main__":

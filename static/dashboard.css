@@ -97,6 +97,18 @@ button:focus-visible, input:focus-visible, a:focus-visible {
 .mode-badge.unknown { color: var(--amber); background: var(--amber-soft); border-color: rgb(241 195 110 / 32%); }
 .last-updated { color: var(--faint); white-space: nowrap; }
 
+.public-access-alert {
+  display: flex; align-items: center; gap: 11px; margin: 14px 0 0; padding: 11px 13px;
+  border: 1px solid rgb(241 195 110 / 38%); border-radius: 10px;
+  background: linear-gradient(90deg, #342a1b, #251f1a); color: #ffe5b4;
+}
+.public-access-icon {
+  width: 23px; height: 23px; display: grid; flex: 0 0 auto; place-items: center;
+  border-radius: 7px; background: #51401e; color: var(--amber); font-weight: 850;
+}
+.public-access-alert > span:last-child { display: grid; gap: 1px; font-size: 10px; }
+.public-access-alert strong { font-size: 11px; }
+
 .page-heading {
   display: flex; align-items: flex-end; justify-content: space-between; gap: 24px;
   padding: 30px 0 23px;

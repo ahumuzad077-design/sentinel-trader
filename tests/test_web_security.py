@@ -1,9 +1,9 @@
-import base64
 import importlib
 import os
 import sys
 import types
 import unittest
+from unittest.mock import patch
 
 
 class DummyEngine:
@@ -35,8 +35,7 @@ class DummyChat:
         return {"reply": "ok", "type": "text"}
 
 
-# Keep these route tests independent of broker SDK availability and never
-# construct an actual trading client.
+# These route tests never construct a real trading client or call a broker.
 bot_stub = types.ModuleType("bot")
 bot_stub.TraderEngine = DummyEngine
 bot_stub.ChatEngine = DummyChat
@@ -44,7 +43,7 @@ sys.modules["bot"] = bot_stub
 web = importlib.import_module("web")
 
 
-class DashboardAuthTests(unittest.TestCase):
+class PublicDashboardTests(unittest.TestCase):
     def setUp(self):
         self.old_user = os.environ.pop("DASHBOARD_USERNAME", None)
         self.old_password = os.environ.pop("DASHBOARD_PASSWORD", None)
@@ -63,63 +62,67 @@ class DashboardAuthTests(unittest.TestCase):
         if self.old_password is not None:
             os.environ["DASHBOARD_PASSWORD"] = self.old_password
 
-    def auth_headers(self, username="operator", password="long-test-password"):
-        token = base64.b64encode(f"{username}:{password}".encode()).decode()
-        return {"Authorization": f"Basic {token}"}
+    def same_origin_headers(self):
+        return {"Origin": "https://localhost"}
 
-    def test_health_is_minimal_and_available_without_credentials(self):
+    def test_health_is_public_and_minimal(self):
         response = self.client.get("/healthz")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.get_json(), {"ok": True})
 
-    def test_dashboard_security_headers_and_favicon(self):
-        os.environ["DASHBOARD_USERNAME"] = "operator"
-        os.environ["DASHBOARD_PASSWORD"] = "long-test-password"
-        headers = self.auth_headers()
-        response = self.client.get("/", headers=headers)
-        self.assertEqual(response.status_code, 200)
-        self.assertIn("default-src 'self'", response.headers["Content-Security-Policy"])
-        self.assertEqual(response.headers["X-Frame-Options"], "DENY")
-        icon = self.client.get("/favicon.ico", headers=headers)
+    def test_dashboard_and_account_state_are_public_without_auth(self):
+        os.environ["DASHBOARD_USERNAME"] = "legacy-user"
+        os.environ["DASHBOARD_PASSWORD"] = "legacy-password"
+        page = self.client.get("/")
+        self.assertEqual(page.status_code, 200)
+        self.assertNotIn("WWW-Authenticate", page.headers)
+
+        state = self.client.get("/api/state")
+        self.assertEqual(state.status_code, 200)
+        self.assertEqual(state.get_json()["mode"], "PAPER")
+        self.assertNotIn("WWW-Authenticate", state.headers)
+        self.assertIsNone(web._engine)
+
+    def test_public_auto_start_requires_separate_opt_in(self):
+        with patch.dict(os.environ, {
+                "AUTO_START": "true", "ALLOW_PUBLIC_AUTO_START": "false"}):
+            self.assertFalse(web._public_auto_start_enabled())
+        with patch.dict(os.environ, {
+                "AUTO_START": "true", "ALLOW_PUBLIC_AUTO_START": "true"}):
+            self.assertTrue(web._public_auto_start_enabled())
+
+    def test_security_headers_and_favicon_are_public(self):
+        page = self.client.get("/")
+        self.assertIn("default-src 'self'", page.headers["Content-Security-Policy"])
+        self.assertEqual(page.headers["X-Frame-Options"], "DENY")
+
+        icon = self.client.get("/favicon.ico")
         self.assertEqual(icon.status_code, 200)
         self.assertEqual(icon.mimetype, "image/svg+xml")
         self.assertIn(b"<svg", icon.data)
         icon.close()
 
-    def test_dashboard_and_state_fail_closed_without_config(self):
-        for method, path in (("get", "/"), ("get", "/api/state"),
-                             ("post", "/api/start"),
-                             ("post", "/api/chat")):
-            response = getattr(self.client, method)(path)
-            self.assertEqual(response.status_code, 401, path)
-            self.assertIn("WWW-Authenticate", response.headers)
-        self.assertIsNone(web._engine)
+    def test_public_chat_route_is_available_without_auth(self):
+        response = self.client.post("/api/chat", json={"message": "account"},
+                                   headers=self.same_origin_headers())
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["reply"], "ok")
 
-    def test_wrong_credentials_are_rejected(self):
-        os.environ["DASHBOARD_USERNAME"] = "operator"
-        os.environ["DASHBOARD_PASSWORD"] = "long-test-password"
-        response = self.client.get("/api/state", headers=self.auth_headers(
-            password="wrong-password"))
-        self.assertEqual(response.status_code, 401)
-
-    def test_correct_credentials_can_read_and_control(self):
-        os.environ["DASHBOARD_USERNAME"] = "operator"
-        os.environ["DASHBOARD_PASSWORD"] = "long-test-password"
-        headers = self.auth_headers()
-        self.assertEqual(self.client.get("/api/state", headers=headers).status_code,
-                         200)
-        headers["Origin"] = "https://localhost"
-        response = self.client.post("/api/start", headers=headers)
+    def test_public_start_requires_same_origin_but_no_password(self):
+        response = self.client.post("/api/start", headers=self.same_origin_headers())
         self.assertEqual(response.status_code, 200)
         self.assertTrue(web._engine.started)
 
-    def test_live_start_requires_exact_server_side_acknowledgement(self):
-        os.environ["DASHBOARD_USERNAME"] = "operator"
-        os.environ["DASHBOARD_PASSWORD"] = "long-test-password"
+    def test_cross_origin_control_request_is_rejected_without_auth(self):
+        headers = {"Origin": "https://attacker.example"}
+        response = self.client.post("/api/start", headers=headers)
+        self.assertEqual(response.status_code, 403)
+        self.assertIsNone(web._engine)
+
+    def test_live_start_requires_exact_acknowledgement_without_auth(self):
         old_engine_class = web.TraderEngine
         web.TraderEngine = DummyLiveEngine
-        headers = self.auth_headers()
-        headers["Origin"] = "https://localhost"
+        headers = self.same_origin_headers()
         try:
             response = self.client.post("/api/start", headers=headers)
             self.assertEqual(response.status_code, 400)
@@ -131,23 +134,13 @@ class DashboardAuthTests(unittest.TestCase):
         finally:
             web.TraderEngine = old_engine_class
 
-    def test_cross_origin_control_request_is_rejected(self):
-        os.environ["DASHBOARD_USERNAME"] = "operator"
-        os.environ["DASHBOARD_PASSWORD"] = "long-test-password"
-        headers = self.auth_headers()
-        headers["Origin"] = "https://attacker.example"
-        response = self.client.post("/api/start", headers=headers)
-        self.assertEqual(response.status_code, 403)
-        self.assertIsNone(web._engine)
-
-    def test_plain_http_is_rejected_even_with_valid_credentials(self):
-        os.environ["DASHBOARD_USERNAME"] = "operator"
-        os.environ["DASHBOARD_PASSWORD"] = "long-test-password"
-        response = self.client.get("/api/state", headers=self.auth_headers(),
-                                   base_url="http://localhost",
-                                   environ_overrides={"HTTP_X_FORWARDED_PROTO": "http"})
+    def test_plain_http_is_rejected(self):
+        response = self.client.get(
+            "/api/state", base_url="http://localhost",
+            environ_overrides={"HTTP_X_FORWARDED_PROTO": "http"})
         self.assertEqual(response.status_code, 400)
         self.assertEqual(response.get_json()["error"], "HTTPS is required.")
+        self.assertNotIn("WWW-Authenticate", response.headers)
 
 
 if __name__ == "__main__":

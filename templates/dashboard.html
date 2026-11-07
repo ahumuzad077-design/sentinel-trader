@@ -7,8 +7,8 @@
   <meta name="description" content="Sentinel trading and account monitoring console">
   <title>Sentinel | Trading Console</title>
   <link rel="icon" type="image/svg+xml" href="{{ url_for('static', filename='favicon.svg') }}">
-  <link rel="stylesheet" href="{{ url_for('static', filename='dashboard.css') }}?v=20261103">
-  <script defer src="{{ url_for('static', filename='dashboard.js') }}?v=20261103"></script>
+  <link rel="stylesheet" href="{{ url_for('static', filename='dashboard.css') }}?v=20261107-public">
+  <script defer src="{{ url_for('static', filename='dashboard.js') }}?v=20261107-public"></script>
 </head>
 <body>
   <a class="skip-link" href="#main-content">Skip to dashboard</a>
@@ -26,6 +26,11 @@
         <span class="last-updated">Updated <time id="updatedAt">—</time></span>
       </div>
     </header>
+
+    <aside class="public-access-alert" role="note" aria-label="Public access warning">
+      <span class="public-access-icon" aria-hidden="true">!</span>
+      <span><strong>Public trading controls</strong><span>Anyone with this link can view dashboard data and use the controls. Keep live trading disabled unless you accept that exposure.</span></span>
+    </aside>
 
     <main id="main-content">
       <section class="page-heading" aria-labelledby="page-title">

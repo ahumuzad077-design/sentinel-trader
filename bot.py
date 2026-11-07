@@ -10,7 +10,7 @@ Features:
 - General chat: answers any question, not just trading
 """
 
-import os, re, json, time, sqlite3, threading
+import os, re, json, time, sqlite3, threading, math
 from collections import deque
 from datetime import datetime, timedelta
 
@@ -106,11 +106,19 @@ class RiskEngine:
             self.halt_reason = f"{self.consecutive_losses} consecutive losses"
 
     def full_report(self, account, positions, decision, entry, atr, is_crypto):
-        eq = account["equity"]
-        self.update_equity(eq)
+        try:
+            eq = float(account["equity"])
+        except (KeyError, TypeError, ValueError):
+            eq = float("nan")
         r = {"approved": False, "reason": "", "size_pct": 0.0, "qty": 0,
              "stop_loss": 0.0, "take_profit": 0.0, "risk_amount": 0.0,
              "reward_amount": 0.0, "position_value": 0.0, "checks": []}
+
+        if not math.isfinite(eq) or eq <= 0:
+            r["reason"] = "Invalid account equity"
+            r["checks"].append(("Account equity", False, r["reason"]))
+            return r
+        self.update_equity(eq)
 
         if self.halted:
             r["reason"] = f"HALTED: {self.halt_reason}"
@@ -158,48 +166,95 @@ class RiskEngine:
                 r["reason"] = "Max crypto positions"
                 return r
 
-        if decision["action"] == "HOLD":
-            r["reason"] = "LLM says HOLD"
-            r["checks"].append(("LLM verdict", False, "HOLD"))
+        action = decision.get("action")
+        if action != "BUY":
+            r["reason"] = ("LLM says HOLD" if action == "HOLD" else
+                            "Short entries are not supported; use close to exit")
+            r["checks"].append(("LLM verdict", False, str(action)))
             return r
-        r["checks"].append(("LLM verdict", True, decision["action"]))
+        r["checks"].append(("LLM verdict", True, action))
 
-        conf = decision.get("confidence", 0)
+        try:
+            conf = float(decision.get("confidence", 0))
+            eq = float(eq)
+            entry = float(entry)
+            atr = float(atr)
+        except (TypeError, ValueError):
+            r["reason"] = "Invalid account or market data"
+            r["checks"].append(("Market data", False, r["reason"]))
+            return r
+        if (not all(math.isfinite(v) for v in (eq, entry, atr, conf))
+                or eq <= 0 or entry <= 0 or atr <= 0 or not 0 <= conf <= 1):
+            r["reason"] = "Invalid account, price, volatility, or confidence"
+            r["checks"].append(("Market data", False, r["reason"]))
+            return r
+
         ok = conf >= self.cfg["min_confidence"]
         r["checks"].append(("Confidence", ok, f"{conf:.2f}"))
         if not ok:
             r["reason"] = f"Low confidence {conf:.2f}"
             return r
 
-        sp = min(self.cfg["max_position_pct"],
-                 self.cfg["max_position_pct"] * conf)
-        notional = eq * sp
+        position_pct = float(self.cfg["max_position_pct"])
+        stop_multiplier = float(self.cfg["atr_stop_multiplier"])
+        rr = float(self.cfg["risk_reward_ratio"])
+        if (not all(math.isfinite(v) for v in
+                    (position_pct, stop_multiplier, rr))
+                or not 0 < position_pct <= 1
+                or stop_multiplier <= 0 or rr <= 0):
+            r["reason"] = "Invalid position, stop, or reward-ratio configuration"
+            r["checks"].append(("Risk configuration", False, r["reason"]))
+            return r
 
+        sp = position_pct * conf
+        max_position_value = eq * sp
+        risk_pct = float(self.cfg.get("max_trade_risk_pct", 0.005))
+        if not math.isfinite(risk_pct) or not 0 < risk_pct <= 0.02:
+            r["reason"] = "MAX_TRADE_RISK_PCT must be greater than 0 and at most 0.02"
+            r["checks"].append(("Risk configuration", False, r["reason"]))
+            return r
+        risk_budget = eq * risk_pct
+        stop_distance = atr * stop_multiplier
+        if not math.isfinite(stop_distance) or stop_distance <= 0:
+            r["reason"] = "Invalid stop distance"
+            r["checks"].append(("Stop distance", False, r["reason"]))
+            return r
+
+        # Cap quantity independently by notional exposure and stop-distance loss.
+        raw_qty = min(max_position_value / entry, risk_budget / stop_distance)
         if is_crypto:
-            qty = round(max(0.0001, notional / entry), 6)
+            qty = math.floor(raw_qty * 1_000_000) / 1_000_000
         else:
-            qty = max(1, int(notional / entry))
+            qty = math.floor(raw_qty)
+        if qty <= 0:
+            r["reason"] = "Risk budget is too small for the minimum order size"
+            r["checks"].append(("Position size", False, r["reason"]))
+            return r
 
         actual = qty * entry
-        if actual > eq * self.cfg["max_position_pct"] * 1.5:
-            r["reason"] = f"Size sanity: ${actual:.0f} too large"
-            r["checks"].append(("Size sanity", False, r["reason"]))
-            return r
-        r["checks"].append(("Size sanity", True, f"${actual:.0f}"))
-
-        d = atr * self.cfg["atr_stop_multiplier"]
-        rr = self.cfg["risk_reward_ratio"]
+        r["checks"].append(("Size sanity", actual <= max_position_value,
+                            f"${actual:.2f} / ${max_position_value:.2f}"))
+        d = stop_distance
         dec = 4 if is_crypto else 2
-        if decision["action"] == "BUY":
-            sl = round(entry - d, dec)
-            tp = round(entry + d * rr, dec)
-        else:
-            sl = round(entry + d, dec)
-            tp = round(entry - d * rr, dec)
+        sl = round(entry - d, dec)
+        tp = round(entry + d * rr, dec)
+        if sl <= 0 or tp <= entry:
+            r["reason"] = "Stop or target is invalid at the current price"
+            r["checks"].append(("Protective levels", False, r["reason"]))
+            return r
 
         ra = abs(entry - sl) * qty
         wa = abs(tp - entry) * qty
         rra = wa / max(ra, 0.01)
+        if ra > risk_budget + 1e-8:
+            r["reason"] = "Calculated loss exceeds the per-trade risk budget"
+            r["checks"].append(("Per-trade risk", False,
+                                f"${ra:.2f} / ${risk_budget:.2f}"))
+            return r
+        if rra < rr - 0.05:
+            r["reason"] = "Rounded stop/target does not meet the risk/reward floor"
+            r["checks"].append(("Risk/reward", False, f"{rra:.2f}:1"))
+            return r
 
         r.update({"approved": True, "reason": "approved", "size_pct": sp,
                   "qty": qty, "stop_loss": sl, "take_profit": tp,
@@ -236,6 +291,7 @@ def load_config():
         "groq_key": get("GROQ_API_KEY", req=True),
         "nvidia_key": get("NVIDIA_API_KEY", ""),
         "paper": get("ALPACA_PAPER_TRADE", "true").lower() == "true",
+        "allow_live_trading": get("ALLOW_LIVE_TRADING", "false").lower() == "true",
         "model_judge": get("LLM_MODEL_JUDGE", "openai/gpt-oss-20b"),
         "model_debate": get("LLM_MODEL_DEBATE", "openai/gpt-oss-20b"),
         "model_research": get("LLM_MODEL_RESEARCH", "openai/gpt-oss-20b"),
@@ -248,10 +304,12 @@ def load_config():
                            if s.strip()],
         "cycle_seconds": int(get("CYCLE_SECONDS", "3600")),
         "entry_cooldown_seconds": int(get("ENTRY_COOLDOWN_SECONDS", "3600")),
+        "max_entry_drift_pct": float(get("MAX_ENTRY_DRIFT_PCT", "0.002")),
         "research_every_n": int(get("RESEARCH_EVERY_N", "20")),
         "screen_top_stocks": int(get("SCREEN_TOP_STOCKS", "5")),
         "screen_top_crypto": int(get("SCREEN_TOP_CRYPTO", "2")),
         "max_position_pct": float(get("MAX_POSITION_PCT", "0.03")),
+        "max_trade_risk_pct": float(get("MAX_TRADE_RISK_PCT", "0.005")),
         "max_daily_loss_pct": float(get("MAX_DAILY_LOSS_PCT", "0.02")),
         "max_total_drawdown_pct": float(get("MAX_TOTAL_DRAWDOWN_PCT", "0.06")),
         "max_concurrent_positions": int(get("MAX_CONCURRENT_POSITIONS", "5")),
@@ -357,6 +415,10 @@ class SentinelEngine:
         self.on_bars = on_bars or (lambda s, b, t: None)
 
         self.cfg = load_config()
+        if not self.cfg["paper"] and not self.cfg["allow_live_trading"]:
+            raise RuntimeError(
+                "Live trading is disabled. Set ALLOW_LIVE_TRADING=true only "
+                "after separately validating account permissions and risk controls.")
         self.trade = TradingClient(self.cfg["alpaca_key"],
             self.cfg["alpaca_secret"], paper=self.cfg["paper"])
         self.data = StockHistoricalDataClient(self.cfg["alpaca_key"],
@@ -376,6 +438,7 @@ class SentinelEngine:
         self.learner = LearningEngine(self.cfg["journal_path"]) if LearningEngine else None
         self._active_trades = {}
         self._pending_entries = {}
+        self._execution_lock = threading.Lock()
         self._stop_event = threading.Event()
         self._thread = None
         self._last_day = None
@@ -413,6 +476,16 @@ class SentinelEngine:
             self.on_bars(s, b, t)
         except Exception:
             pass
+
+    def _emit_account_snapshot(self, account, positions):
+        self._emit(equity=account["equity"],
+                   buying_power=account["buying_power"],
+                   positions=positions,
+                   halted=self.risk.halted,
+                   halt_reason=self.risk.halt_reason,
+                   mode="PAPER" if self.cfg["paper"] else "LIVE",
+                   equity_curve=list(self._equity_curve),
+                   cycle=self._cycle_count)
 
     # ---------- LLM ----------
 
@@ -693,6 +766,12 @@ class SentinelEngine:
         except Exception as e:
             return {"ok": False, "error": f"Broker error: {e}"}
 
+        self._emit_account_snapshot(account, positions)
+
+        if any(p["symbol"] == symbol for p in positions):
+            return {"ok": False, "symbol": symbol,
+                    "reason": f"Already holding {symbol}; manage or close the existing position."}
+
         try:
             bars = self._bars(symbol)
         except Exception as e:
@@ -775,18 +854,93 @@ class SentinelEngine:
                 "risk_amount": report["risk_amount"],
                 "reward_amount": report["reward_amount"],
                 "is_crypto": is_crypto,
+                "created_at": time.time(),
                 "checks": report["checks"]}
 
     def execute_proposal(self, p):
-        symbol = p["symbol"]
+        with self._execution_lock:
+            return self._execute_proposal_locked(p)
+
+    def _execute_proposal_locked(self, p):
+        """Revalidate a short-lived proposal immediately before order submission."""
         try:
-            order = self._submit(symbol, p["qty"], p["action"])
+            symbol = str(p["symbol"]).upper().strip()
+            action = str(p["action"]).upper()
+            qty = float(p["qty"])
+            entry = float(p["entry"])
+            confidence = float(p.get("confidence", 0))
+            stop_loss = float(p["stop_loss"])
+            take_profit = float(p["take_profit"])
+            created_at = float(p.get("created_at", 0))
+        except (KeyError, TypeError, ValueError):
+            return {"ok": False, "error": "Invalid or incomplete proposal."}
+
+        numbers = (qty, entry, confidence, stop_loss, take_profit, created_at)
+        if (not all(math.isfinite(value) for value in numbers)
+                or action != "BUY" or qty <= 0 or entry <= 0
+                or not 0 <= confidence <= 1):
+            return {"ok": False, "error": "Proposal failed safety validation."}
+        age = time.time() - created_at
+        if age < -5 or age > 120:
+            return {"ok": False, "error": "Proposal expired; analyze again."}
+
+        try:
+            current = self._quote(symbol)["mid"]
+            drift_limit = float(self.cfg.get("max_entry_drift_pct", 0.002))
+            if (not math.isfinite(current) or current <= 0
+                    or not math.isfinite(drift_limit)
+                    or not 0 <= drift_limit <= 0.05):
+                return {"ok": False, "error": "Invalid quote or drift configuration."}
+            drift = abs(current / entry - 1)
+            if drift > drift_limit:
+                return {"ok": False,
+                        "error": "Price moved beyond the proposal limit; analyze again."}
+
+            account = self._account()
+            positions = self._positions()
+            if (any(position["symbol"] == symbol for position in positions)
+                    or symbol in getattr(self, "_pending_entries", {})):
+                return {"ok": False,
+                        "error": "A position or order for this symbol already exists."}
+            bars = self._bars(symbol)
+            atr = self._atr(bars)
+            report = self.risk.full_report(
+                account, positions,
+                {"action": action, "confidence": confidence}, current, atr,
+                "/" in symbol)
+            if not report["approved"]:
+                return {"ok": False,
+                        "error": f"Risk checks no longer approve this order: {report['reason']}"}
+
+            risk_pct = float(self.cfg.get("max_trade_risk_pct", 0.005))
+            risk_budget = float(account["equity"]) * risk_pct
+            actual_risk = max(0.0, current - stop_loss) * qty
+            actual_notional = current * qty
+            notional_limit = (float(account["equity"])
+                              * float(self.cfg["max_position_pct"])
+                              * confidence)
+            reward_risk = ((take_profit - current) / (current - stop_loss)
+                           if current > stop_loss else -1.0)
+            if (stop_loss <= 0 or stop_loss >= current or take_profit <= current
+                    or actual_risk > risk_budget + 1e-8
+                    or actual_notional > notional_limit + 1e-8
+                    or qty > float(report["qty"])
+                    or reward_risk < float(self.cfg["risk_reward_ratio"]) - 0.05):
+                return {"ok": False,
+                        "error": "Proposal no longer fits current risk limits; analyze again."}
+        except Exception:
+            self._log(f"[{symbol}] execution revalidation failed", "error")
+            return {"ok": False,
+                    "error": "Could not revalidate account, quote, or risk; no order sent."}
+
+        try:
+            order = self._submit(symbol, qty, action)
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
         self._active_trades[symbol] = {
-            "symbol": symbol, "side": p["action"], "qty": p["qty"],
-            "entry": p["entry"], "sl": p["stop_loss"], "tp": p["take_profit"],
+            "symbol": symbol, "side": action, "qty": qty,
+            "entry": current, "sl": stop_loss, "tp": take_profit,
             "order_id": str(order.id),
             "opened_at": datetime.utcnow().isoformat(),
             "opened_ts": time.time()}
@@ -794,18 +948,18 @@ class SentinelEngine:
 
         try:
             self.journal.log(symbol=symbol, action=p["action"],
-                confidence=p.get("confidence", 0),
+                confidence=confidence,
                 reason=p.get("reason", ""),
                 bull=p.get("bull",""), bear=p.get("bear",""),
-                approved=True, qty=p["qty"], entry=p["entry"],
-                stop_loss=p["stop_loss"], take_profit=p["take_profit"],
+                approved=True, qty=qty, entry=current,
+                stop_loss=stop_loss, take_profit=take_profit,
                 order_id=str(order.id))
         except Exception:
             pass
 
         return {"ok": True, "order_id": str(order.id),
-                "symbol": symbol, "qty": p["qty"],
-                "side": p["action"], "entry": p["entry"]}
+                "symbol": symbol, "qty": qty,
+                "side": action, "entry": current}
 
     # ---------- main loop ----------
 
@@ -1024,8 +1178,12 @@ class ChatEngine:
         pending_txt = ""
         if self.pending:
             p = self.pending
-            pending_txt = (f"\nPENDING PROPOSAL: {p['action']} {p['qty']} "
-                           f"{p['symbol']} @ {p['entry']:.4f}")
+            if p.get("pending_type") == "exit":
+                symbols = ", ".join(position["symbol"] for position in p["positions"])
+                pending_txt = f"\nPENDING POSITION CLOSE: {symbols}"
+            else:
+                pending_txt = (f"\nPENDING PROPOSAL: {p['action']} {p['qty']} "
+                               f"{p['symbol']} @ {p['entry']:.4f}")
 
         conv_hist = ""
         if len(self.history) > 0:
@@ -1188,6 +1346,8 @@ class ChatEngine:
         if a == "positions":
             try:
                 ps = self.engine._positions()
+                account = self.engine._account()
+                self.engine._emit_account_snapshot(account, ps)
                 if not ps:
                     return {"reply": "No open positions.",
                             "pending": self.pending, "type": "text"}
@@ -1211,6 +1371,8 @@ class ChatEngine:
         if a == "cash":
             try:
                 acc = self.engine._account()
+                ps = self.engine._positions()
+                self.engine._emit_account_snapshot(acc, ps)
                 return {"reply": f"Equity ${acc['equity']:.2f}, "
                                   f"buying power ${acc['buying_power']:.2f}",
                         "pending": self.pending, "type": "text"}
@@ -1229,14 +1391,15 @@ class ChatEngine:
 
         if a == "close":
             sym = action.get("symbol", "").upper()
-            held = any(p["symbol"] == sym for p in self.engine._positions())
-            if not held:
+            positions = self.engine._positions()
+            selected = [position for position in positions
+                        if position["symbol"] == sym]
+            if not selected:
                 return {"reply": f"Not holding {sym}.",
                         "pending": self.pending, "type": "text"}
-            ok = self.engine._close_position(sym, "manual close via chat")
-            return {"reply": f"{sym}: closed." if ok else f"{sym}: close failed.",
-                    "pending": self.pending,
-                    "type": "trade" if ok else "error"}
+            self.pending = self._make_exit_proposal(selected)
+            return {"reply": f"Review the close request for {sym}. No order has been sent.",
+                    "pending": self.pending, "type": "exit-proposal"}
 
         if a == "close_all":
             try:
@@ -1244,18 +1407,9 @@ class ChatEngine:
                 if not positions:
                     return {"reply": "No positions to close.",
                             "pending": self.pending, "type": "text"}
-                closed = []
-                failed = []
-                for p in positions:
-                    sym = p["symbol"]
-                    if self.engine._close_position(sym, "manual close all"):
-                        closed.append(sym)
-                    else:
-                        failed.append(sym)
-                msg = f"Closed {len(closed)}: {', '.join(closed)}"
-                if failed:
-                    msg += f"\nFailed: {', '.join(failed)}"
-                return {"reply": msg, "pending": self.pending, "type": "trade"}
+                self.pending = self._make_exit_proposal(positions)
+                return {"reply": "Review the close-all request below. No order has been sent.",
+                        "pending": self.pending, "type": "exit-proposal"}
             except Exception as e:
                 return {"reply": f"Close-all error: {e}",
                         "pending": self.pending, "type": "error"}
@@ -1264,11 +1418,13 @@ class ChatEngine:
             if not self.pending:
                 return {"reply": "Nothing pending.",
                         "pending": None, "type": "text"}
+            if self.pending.get("pending_type") == "exit":
+                return self._confirm_exit()
             res = self.engine.execute_proposal(self.pending)
             if res["ok"]:
                 msg = (f"EXECUTED: {res['side']} {res['qty']} {res['symbol']} "
                        f"@ ~{res['entry']:.4f}\nOrder ID: {res['order_id']}\n"
-                       f"SL/TP monitoring active.")
+                       "Stop/target are locally monitored, not broker-protected.")
                 self.pending = None
                 return {"reply": msg, "pending": None, "type": "trade"}
             return {"reply": f"Execution failed: {res.get('error')}",
@@ -1280,6 +1436,62 @@ class ChatEngine:
 
         return {"reply": f"Unknown action: {a}",
                 "pending": self.pending, "type": "text"}
+
+    def _make_exit_proposal(self, positions):
+        selected = [{
+            "symbol": str(position["symbol"]),
+            "qty": float(position["qty"]),
+            "unrealized_pl": float(position.get("unrealized_pl", 0)),
+        } for position in positions]
+        return {"pending_type": "exit", "positions": selected,
+                "created_at": time.time()}
+
+    def _confirm_exit(self):
+        proposal = self.pending
+        if time.time() - float(proposal.get("created_at", 0)) > 120:
+            self.pending = None
+            return {"reply": "Close request expired. Request a fresh close review.",
+                    "pending": None, "type": "error"}
+        try:
+            live_positions = self.engine._positions()
+            by_symbol = {position["symbol"]: position for position in live_positions}
+            for proposed in proposal["positions"]:
+                current = by_symbol.get(proposed["symbol"])
+                quantity_changed = (
+                    current is None or
+                    abs(float(current["qty"]) - proposed["qty"]) >
+                    max(1e-8, abs(proposed["qty"]) * 1e-6)
+                )
+                if quantity_changed:
+                    self.pending = None
+                    return {"reply": (f"Position {proposed['symbol']} changed since review. "
+                                      "No close was sent; request a new review."),
+                            "pending": None, "type": "error"}
+
+            submitted, failed = [], []
+            for proposed in proposal["positions"]:
+                symbol = proposed["symbol"]
+                if self.engine._close_position(symbol, "manual close via confirmed chat"):
+                    submitted.append(symbol)
+                else:
+                    failed.append(symbol)
+            self.pending = None
+            try:
+                account = self.engine._account()
+                positions = self.engine._positions()
+                self.engine._emit_account_snapshot(account, positions)
+            except Exception:
+                pass
+            lines = [f"Close request submitted for {len(submitted)} position(s): "
+                     f"{', '.join(submitted) or 'none'}. "]
+            if failed:
+                lines.append(f"Could not submit for: {', '.join(failed)}.")
+            lines.append("Verify fills and remaining positions with the broker.")
+            return {"reply": "\n".join(lines), "pending": None,
+                    "type": "trade" if submitted else "error"}
+        except Exception as exc:
+            return {"reply": f"Could not recheck positions; no close was sent: {exc}",
+                    "pending": proposal, "type": "error"}
 
     def _do_analyze(self, symbol):
         if not symbol:
@@ -1298,7 +1510,7 @@ class ChatEngine:
             return {"reply": f"{symbol}: no trade. {reason}",
                     "pending": None, "type": "text"}
 
-        self.pending = result
+        self.pending = {**result, "pending_type": "entry"}
         arrow = "BUY" if result["action"] == "BUY" else "SELL"
         notional = result["entry"] * result["qty"]
         msg = (

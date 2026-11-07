@@ -1,28 +1,13 @@
-"""Sentinel crypto trader - force-trades open crypto markets.
+"""Optional one-shot crypto scanner; paper-order placement is opt-in only.
 
-Since crypto trades 24/7, this script scans all crypto pairs and places
-real orders on Alpaca paper for the first N that pass the checks.
+The runner refuses live mode and does not weaken thresholds from the app
+configuration. It is experimental and not a prop-firm compliance tool.
 """
 
 from dotenv import load_dotenv
 load_dotenv(override=True)
 
 import os
-
-# ---- Loosen thresholds for this run only ----
-os.environ["MIN_CONFIDENCE"] = "0.30"
-os.environ["RISK_REWARD_RATIO"] = "1.3"
-os.environ["ATR_STOP_MULTIPLIER"] = "1.0"
-os.environ["MAX_POSITION_PCT"] = "0.03"
-os.environ["MAX_CRYPTO_POSITIONS"] = "5"
-
-# NIM first (Groq is often rate-limited)
-os.environ["NIM_FALLBACKS"] = (
-    "deepseek-ai/deepseek-v4.1-flash,"
-    "google/gemma-4-31b-it,"
-    "databricks/dbrx-instruct,"
-    "meta/llama-3.1-8b-instruct"
-)
 
 from bot import SentinelEngine
 
@@ -37,6 +22,14 @@ CRYPTO_PAIRS = [
 MAX_TRADES = 3
 
 def main():
+    if os.environ.get("ALPACA_PAPER_TRADE", "true").lower() != "true":
+        print("Refusing to run crypto order placement outside paper mode.")
+        return
+    if os.environ.get("ENABLE_CRYPTO_ORDER_PLACEMENT", "false").lower() != "true":
+        print("Crypto order placement is disabled. Set "
+              "ENABLE_CRYPTO_ORDER_PLACEMENT=true to opt in to paper orders.")
+        return
+
     print("=" * 60)
     print("  Sentinel Crypto Trader")
     print("=" * 60)
